@@ -49,7 +49,11 @@ def main():
             expected = reference(z_tr)
             for label, fn in variants:
                 # Compile, launch, and check correctness before timing.
-                torch.testing.assert_close(fn(z_tr), expected, atol=5e-3, rtol=5e-3)
+                # BF16 can differ by an output rounding step even when FP32
+                # intermediates agree closely. Tight FP32/FP64 checks live in
+                # the correctness suite and must pass before benchmarking.
+                rtol = max(5e-3, torch.finfo(dtype).eps)
+                torch.testing.assert_close(fn(z_tr), expected, atol=5e-3, rtol=rtol)
                 ms = triton.testing.do_bench(lambda: fn(z_tr), warmup=25, rep=100)
                 torch.cuda.synchronize()
                 baseline = torch.cuda.memory_allocated()

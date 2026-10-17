@@ -30,10 +30,17 @@ class TiledKernelTests(unittest.TestCase):
                                  not normalized, normalized, 'identity')
                     expected = (avey_b(z_tr, backend='torch') if normalized
                                 else avey(z_tr, v, backend='torch'))
-                    # Triton 3.7's interpreter truncates FP32 -> BF16 in
-                    # create_fp_trunc; CUDA rounds to nearest. Permit one ULP
-                    # only for this interpreter case, not the GPU checks.
-                    rtol = torch.finfo(dtype).eps if INTERPRET and dtype == torch.bfloat16 else 2e-3
+                    # Nearby FP32 sums can straddle a BF16 rounding midpoint
+                    # and become adjacent output values, including on CUDA.
+                    # Keep a separate tight check on pre-rounding arithmetic.
+                    unrounded = mix(z_tr.float(), z_tr_norm,
+                                    selected_v.float() if selected_v is not None else None,
+                                    None, None, None, 1e-6,
+                                    not normalized, normalized, 'identity')
+                    oracle = (avey_b(z_tr.double(), backend='torch') if normalized
+                              else avey(z_tr.double(), v.double(), backend='torch'))
+                    torch.testing.assert_close(unrounded.double(), oracle, atol=1e-5, rtol=1e-5)
+                    rtol = max(2e-3, torch.finfo(dtype).eps)
                     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=rtol)
 
     def test_tiled_kernel_matches_reference(self):
@@ -92,17 +99,23 @@ class CudaIntegrationTests(unittest.TestCase):
             selected_v = torch.randn(35, 35, device='cuda', dtype=dtype)
             z_tl = torch.rand_like(z_tr)
             bias = torch.randn(37, device='cuda', dtype=dtype)
-            for fn in (lambda x: avey(x, selected_v, z_tl=z_tl, bias=bias, backend='triton'),
-                       lambda x: avey_b(x, z_tl=z_tl, bias=bias, backend='triton')):
-                eager = fn(z_tr)
-                compiled = torch.compile(fn, fullgraph=True)(z_tr)
-                torch.testing.assert_close(compiled, eager, atol=2e-3, rtol=2e-3)
-            torch.testing.assert_close(
-                avey_b(z_tr, backend='triton'), avey_b(z_tr, backend='torch'),
-                atol=2e-3, rtol=2e-3)
-            torch.testing.assert_close(
-                avey(z_tr, selected_v, backend='triton'), avey(z_tr, selected_v, backend='torch'),
-                atol=2e-3, rtol=2e-3)
+            rtol = max(2e-3, torch.finfo(dtype).eps)
+            with self.subTest(dtype=dtype):
+                for fn in (lambda x: avey(x, selected_v, z_tl=z_tl, bias=bias, backend='triton'),
+                           lambda x: avey_b(x, z_tl=z_tl, bias=bias, backend='triton')):
+                    eager = fn(z_tr)
+                    compiled = torch.compile(fn, fullgraph=True)(z_tr)
+                    torch.testing.assert_close(compiled, eager, atol=2e-3, rtol=rtol)
+                for name, op, extra in (('Avey', avey, (selected_v,)), ('Avey-B', avey_b, ())):
+                    with self.subTest(operation=name):
+                        # Verify the underlying FP32 computation against FP64
+                        # before allowing dtype-dependent output rounding.
+                        unrounded = op(z_tr.float(), *(v.float() for v in extra), backend='triton')
+                        oracle = op(z_tr.double(), *(v.double() for v in extra), backend='torch')
+                        torch.testing.assert_close(unrounded.double(), oracle, atol=1e-5, rtol=1e-5)
+                        torch.testing.assert_close(
+                            op(z_tr, *extra, backend='triton'), op(z_tr, *extra, backend='torch'),
+                            atol=2e-3, rtol=rtol)
 
     def test_noncontiguous_inputs_and_gradient_fallback(self):
         z_tr = torch.rand(2, 37, 35, device='cuda').transpose(1, 2)
