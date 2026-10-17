@@ -99,18 +99,20 @@ def mix(
     z_tr: torch.Tensor, z_tr_norm: torch.Tensor, v: Optional[torch.Tensor],
     z_tl: Optional[torch.Tensor], bias: Optional[torch.Tensor],
     valid: Optional[torch.Tensor], eps: float, causal: bool,
-    normalize: bool, activation: str,
+    normalize: bool, activation: str, output_tile: int = 32,
 ) -> torch.Tensor:
+    if type(output_tile) is not int or output_tile not in (32, 64, 128):
+        raise ValueError('output_tile must be 32, 64, or 128')
     out = torch.empty(z_tr.shape, device=z_tr.device, dtype=z_tr.dtype)
     batch, c, d_prime = z_tr.shape
     activation_id = {'identity': 0, 'relu': 1, 'relu2': 2, 'silu': 3, 'gelu': 4}[activation]
     # Dummy pointers have dead loads: constexpr flags remove unused arguments.
-    wrap_triton(_mix_kernel)[(triton.cdiv(c, 16) * triton.cdiv(d_prime, 32), batch)](
+    wrap_triton(_mix_kernel)[(triton.cdiv(c, 16) * triton.cdiv(d_prime, output_tile), batch)](
         z_tr, z_tr_norm, v if v is not None else z_tr,
         z_tl if z_tl is not None else z_tr, bias if bias is not None else z_tr,
         valid if valid is not None else z_tr, out,
         c, d_prime, eps, v is not None, z_tl is not None,
         bias is not None, valid is not None, causal, normalize, activation_id,
-        16, 32, 32, 32, num_warps=4,
+        16, 32, 32, output_tile, num_warps=4,
     )
     return out

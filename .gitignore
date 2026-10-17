@@ -7,3 +7,4 @@ dist/
 papers/
 README.md
 gpu-profile/
+gpu-profile-*/

@@ -16,6 +16,7 @@ def main():
     parser.add_argument('--context', type=int, default=128)
     parser.add_argument('--features', type=int, default=128)
     parser.add_argument('--dtype', choices=('float32', 'float16', 'bfloat16'), default='bfloat16')
+    parser.add_argument('--output-tile', type=int, choices=(32, 64, 128), default=32)
     args = parser.parse_args()
     if not torch.cuda.is_available():
         parser.error('a working NVIDIA GPU/driver is required for timings')
@@ -33,13 +34,14 @@ def main():
     z_tl = torch.rand_like(z_tr)
     bias = torch.rand(args.features, device='cuda', dtype=dtype)
     print(f'{torch.cuda.get_device_name()}; torch={torch.__version__}; '
-          f'triton={triton.__version__}; shape={tuple(z_tr.shape)}; dtype={dtype}')
+          f'triton={triton.__version__}; shape={tuple(z_tr.shape)}; dtype={dtype}; '
+          f'output_tile={args.output_tile}')
     for name, op, extra in [('Avey', avey, (v,)), ('Avey-B dynamic', avey_b, ())]:
         def reference(x):
             return op(x, *extra, z_tl=z_tl, bias=bias, backend='torch')
 
         def fused(x):
-            return op(x, *extra, z_tl=z_tl, bias=bias, backend='triton')
+            return op(x, *extra, z_tl=z_tl, bias=bias, backend='triton', output_tile=args.output_tile)
 
         variants = [('eager reference', reference),
                     ('compiled reference', torch.compile(reference, fullgraph=True, mode='max-autotune')),

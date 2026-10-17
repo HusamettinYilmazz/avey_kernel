@@ -8,6 +8,30 @@ import torch
 
 
 class ProfilingTests(unittest.TestCase):
+    def test_tile_selection_rejects_empty_and_unsupported_widths(self):
+        from benchmarks.profile_contextualizer import build_cases
+
+        z_tr = torch.ones(1, 2, 3)
+        for output_tiles in ((), (16,), (32, 256), (32, 32)):
+            with self.subTest(output_tiles=output_tiles), self.assertRaises(ValueError):
+                build_cases(z_tr, torch.ones(2, 2), z_tr, torch.zeros(3),
+                            include_triton=False, compile_functions=False,
+                            output_tiles=output_tiles)
+
+    def test_profile_labels_keep_output_tiles_separate(self):
+        from benchmarks.profile_contextualizer import build_cases
+
+        z_tr = torch.ones(1, 2, 3)
+        cases = build_cases(z_tr, torch.ones(2, 2), z_tr, torch.zeros(3),
+                            compile_functions=False, output_tiles=(32, 64, 128))
+        for architecture in ('avey', 'avey_b'):
+            for tile in (32, 64, 128):
+                for operation in ('fused', 'mix_only'):
+                    name = f'{architecture}/{operation}/bd{tile}/eager'
+                    matches = [case for case in cases if case.name == name]
+                    self.assertEqual(len(matches), 1)
+                    self.assertEqual(matches[0].output_tile, tile)
+
     def test_component_cases_follow_the_same_math_as_full_calls(self):
         from benchmarks.profile_contextualizer import build_cases
 
@@ -51,7 +75,7 @@ class CudaProfilingTests(unittest.TestCase):
 
         z_tr = torch.rand(1, 5, 7, device='cuda')
         cases = build_cases(z_tr, torch.randn(5, 5, device='cuda'), z_tr,
-                            torch.zeros(7, device='cuda'))
+                            torch.zeros(7, device='cuda'), output_tiles=(32, 64, 128))
         with torch.inference_mode():
             for case in cases:
                 for mode in ('launch', 'cuda_graph'):

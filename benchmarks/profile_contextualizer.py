@@ -1,6 +1,7 @@
 """Profile normalization, mixing, and full contextualizers on NVIDIA SM80+.
 
 python3 -m benchmarks.profile_contextualizer --output-dir gpu-profile
+Compare tiles: add --output-tiles 32 64 128 --output-dir gpu-profile-tiles
 All compilation/warmup precedes timing. Inductor's automatic CUDA graphs are
 disabled; every case is measured with ordinary launches and explicit replay.
 
@@ -34,20 +35,25 @@ class ProfileCase:
     name: str
     fn: Callable[[], torch.Tensor]
     expected: torch.Tensor
+    output_tile: int | None = None
 
 
-def build_cases(z_tr, v, z_tl, bias, *, include_triton=True, compile_functions=True):
+def build_cases(z_tr, v, z_tl, bias, *, include_triton=True, compile_functions=True,
+                output_tiles=(32,)):
     """Mix-only cases consume a precomputed normalized buffer, excluding its cost."""
+    if (not output_tiles or len(set(output_tiles)) != len(output_tiles)
+            or any(type(tile) is not int or tile not in (32, 64, 128) for tile in output_tiles)):
+        raise ValueError('output_tiles must contain distinct widths from 32, 64, 128')
     cases = []
 
-    def add_pair(name, fn, expected):
-        cases.append(ProfileCase(name + '/eager', fn, expected))
+    def add_pair(name, fn, expected, output_tile=None):
+        cases.append(ProfileCase(name + '/eager', fn, expected, output_tile))
         if compile_functions:
             compiled = torch.compile(fn, fullgraph=True, options={
                 'max_autotune': True, 'coordinate_descent_tuning': True,
                 'triton.cudagraphs': False,
             })
-            cases.append(ProfileCase(name + '/compiled', compiled, expected))
+            cases.append(ProfileCase(name + '/compiled', compiled, expected, output_tile))
 
     def normalize():
         return F.normalize(z_tr.float(), dim=-1, eps=1e-12)
@@ -70,15 +76,17 @@ def build_cases(z_tr, v, z_tl, bias, *, include_triton=True, compile_functions=T
         if include_triton:
             from avey_kernels._triton import mix
 
-            def fused(op=op, extra=extra):
-                return op(z_tr, *extra, z_tl=z_tl, bias=bias, backend='triton')
+            for output_tile in output_tiles:
+                def fused(op=op, extra=extra, output_tile=output_tile):
+                    return op(z_tr, *extra, z_tl=z_tl, bias=bias, backend='triton',
+                              output_tile=output_tile)
 
-            def mixing_only(is_avey=(name == 'avey')):
-                return mix(z_tr, z_tr_norm, v if is_avey else None, z_tl, bias,
-                           None, 1e-6, is_avey, not is_avey, 'identity')
+                def mixing_only(is_avey=(name == 'avey'), output_tile=output_tile):
+                    return mix(z_tr, z_tr_norm, v if is_avey else None, z_tl, bias,
+                               None, 1e-6, is_avey, not is_avey, 'identity', output_tile)
 
-            add_pair(name + '/fused', fused, expected)
-            add_pair(name + '/mix_only', mixing_only, expected)
+                add_pair(f'{name}/fused/bd{output_tile}', fused, expected, output_tile)
+                add_pair(f'{name}/mix_only/bd{output_tile}', mixing_only, expected, output_tile)
     return cases
 
 
@@ -135,7 +143,8 @@ def measure_case(case, mode, *, warmup, iterations, repeats):
                         (dispatch_end - wall_start) * 1e6 / iterations,
                         (wall_end - wall_start) * 1e6 / iterations))
     spans, dispatch, wall = zip(*samples)
-    return dict(case=case.name, mode=mode, iterations=iterations, repeats=repeats,
+    return dict(case=case.name, mode=mode, output_tile=case.output_tile,
+                iterations=iterations, repeats=repeats,
                 gpu_span_us=statistics.median(spans),
                 gpu_span_min_us=min(spans), gpu_span_max_us=max(spans),
                 host_dispatch_us=statistics.median(dispatch),
@@ -172,6 +181,8 @@ def main():
     parser.add_argument('--context', type=int, default=128)
     parser.add_argument('--features', type=int, default=128)
     parser.add_argument('--dtype', choices=('float32', 'float16', 'bfloat16'), default='bfloat16')
+    parser.add_argument('--output-tiles', type=int, nargs='+', choices=(32, 64, 128), default=[32],
+                        help='output-feature tile widths to compare (default: 32)')
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--iterations', type=int, default=100)
     parser.add_argument('--repeats', type=int, default=5)
@@ -179,6 +190,8 @@ def main():
     parser.add_argument('--no-compile', action='store_true', help='omit compiled cases for a quick smoke run')
     parser.add_argument('--output-dir', type=Path, default=Path('gpu-profile'))
     args = parser.parse_args()
+    if len(set(args.output_tiles)) != len(args.output_tiles):
+        parser.error('--output-tiles must not contain duplicates')
     if min(args.batch, args.context, args.features, args.warmup,
            args.iterations, args.repeats, args.trace_steps) < 1:
         parser.error('dimensions and iteration counts must be positive')
@@ -200,6 +213,7 @@ def main():
                     triton=triton.__version__, cuda=torch.version.cuda,
                     gpu=torch.cuda.get_device_name(), capability=torch.cuda.get_device_capability(),
                     shape=list(z_tr.shape), dtype=args.dtype, seed=42,
+                    output_tiles=args.output_tiles,
                     automatic_cudagraphs=False, compiled_cases=not args.no_compile,
                     warmup=args.warmup, iterations=args.iterations, repeats=args.repeats,
                     trace_steps=args.trace_steps, matmul_precision='highest')
@@ -213,7 +227,8 @@ def main():
     report_path = args.output_dir / 'report.json'
     print(json.dumps(metadata), flush=True)
     with torch.inference_mode():
-        cases = build_cases(z_tr, v, z_tl, bias, compile_functions=not args.no_compile)
+        cases = build_cases(z_tr, v, z_tl, bias, compile_functions=not args.no_compile,
+                            output_tiles=args.output_tiles)
         # Warm every case before any measurement. Capture, compilation, and
         # checking results must never enter the timed repetition loop.
         for case in cases:

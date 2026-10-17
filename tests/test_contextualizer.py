@@ -75,6 +75,9 @@ class ReferenceTests(unittest.TestCase):
             self.avey_b(z_tr, backend='unknown')
         with self.assertRaises(ValueError):
             self.avey_b(z_tr, valid=torch.ones(1, 3))
+        for output_tile in (16, 256, 32.0):
+            with self.subTest(output_tile=output_tile), self.assertRaises(ValueError):
+                self.avey_b(z_tr, output_tile=output_tile)
 
     def test_auto_backend_preserves_autograd(self):
         z_tr = torch.ones(1, 3, 2, requires_grad=True)

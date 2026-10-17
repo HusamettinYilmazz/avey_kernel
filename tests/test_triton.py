@@ -14,6 +14,33 @@ CAN_RUN = INTERPRET or torch.cuda.is_available()
 
 @unittest.skipUnless(CAN_RUN, 'requires CUDA or TRITON_INTERPRET=1')
 class TiledKernelTests(unittest.TestCase):
+    def test_output_tile_variants_match_reference(self):
+        from avey_kernels._triton import mix
+
+        device = 'cpu' if INTERPRET else 'cuda'
+        torch.manual_seed(29)
+        # 133 features crosses even the widest tile and leaves a partial tail;
+        # 35 tokens crosses both query and key tile boundaries.
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            z_tr = torch.rand(2, 35, 133, device=device, dtype=dtype)
+            z_tr_norm = F.normalize(z_tr.float(), dim=-1)
+            v = torch.randn(35, 35, device=device, dtype=dtype)
+            z_tl = torch.rand_like(z_tr)
+            bias = torch.rand(133, device=device, dtype=dtype)
+            valid = torch.ones(2, 35, device=device, dtype=torch.bool)
+            valid[0, -1] = False
+            valid[1] = False
+            for normalize in (False, True):
+                op, extra = (avey_b, ()) if normalize else (avey, (v,))
+                expected = op(z_tr, *extra, z_tl=z_tl, bias=bias, valid=valid, backend='torch')
+                for output_tile in (32, 64, 128):
+                    with self.subTest(dtype=dtype, normalize=normalize, output_tile=output_tile):
+                        actual = mix(z_tr, z_tr_norm, None if normalize else v,
+                                     z_tl, bias, valid, 1e-6, not normalize,
+                                     normalize, 'identity', output_tile=output_tile)
+                        torch.testing.assert_close(actual, expected, atol=2e-3,
+                                                   rtol=max(2e-3, torch.finfo(dtype).eps))
+
     def test_low_precision_inputs_keep_fp32_normalization(self):
         from avey_kernels._triton import mix
 
@@ -91,6 +118,23 @@ class TiledKernelTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available() and not INTERPRET, 'requires real CUDA')
 class CudaIntegrationTests(unittest.TestCase):
+    def test_output_tile_variants_compile_through_public_api(self):
+        torch.manual_seed(29)
+        z_tr = torch.rand(2, 35, 133, device='cuda')
+        v = torch.randn(35, 35, device='cuda')
+        z_tl = torch.rand_like(z_tr)
+        for op, extra in ((avey, (v,)), (avey_b, ())):
+            expected = op(z_tr, *extra, z_tl=z_tl, backend='torch')
+            for output_tile in (32, 64, 128):
+                with self.subTest(operation=op.__name__, output_tile=output_tile):
+                    def fn(x, op=op, extra=extra, output_tile=output_tile):
+                        return op(x, *extra, z_tl=z_tl, output_tile=output_tile, backend='triton')
+
+                    eager = fn(z_tr)
+                    compiled = torch.compile(fn, fullgraph=True)(z_tr)
+                    torch.testing.assert_close(eager, expected, atol=1e-5, rtol=1e-5)
+                    torch.testing.assert_close(compiled, expected, atol=1e-5, rtol=1e-5)
+
     def test_low_precision_and_fullgraph_compile(self):
         torch.manual_seed(7)
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
