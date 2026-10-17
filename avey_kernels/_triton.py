@@ -101,6 +101,11 @@ def mix(
     valid: Optional[torch.Tensor], eps: float, causal: bool,
     normalize: bool, activation: str, output_tile: int = 32,
 ) -> torch.Tensor:
+    # Dynamo may generalize a changing scalar argument to a backed SymInt.
+    # BD and the launch grid must remain compile-time constants: converting
+    # it to int installs a value guard and specializes this kernel per width.
+    if isinstance(output_tile, torch.SymInt):
+        output_tile = int(output_tile)
     if type(output_tile) is not int or output_tile not in (32, 64, 128):
         raise ValueError('output_tile must be 32, 64, or 128')
     out = torch.empty(z_tr.shape, device=z_tr.device, dtype=z_tr.dtype)
