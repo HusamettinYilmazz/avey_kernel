@@ -6,3 +6,4 @@ dist/
 .venv/
 papers/
 README.md
+gpu-profile/
