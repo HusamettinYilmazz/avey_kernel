@@ -20,7 +20,7 @@ except ModuleNotFoundError as exc:
     _mix = None
 
 
-def _validate(z_tr, v, z_tl, bias, valid, eps, norm_eps, activation, backend, output_tile):
+def _validate(z_tr, v, z_tl, bias, valid, eps, norm_eps, activation, backend, output_tile, autotune):
     if z_tr.ndim != 3 or any(size == 0 for size in z_tr.shape):
         raise ValueError('z_tr must have nonempty shape [batch, context, features]')
     if z_tr.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
@@ -29,6 +29,8 @@ def _validate(z_tr, v, z_tl, bias, valid, eps, norm_eps, activation, backend, ou
         raise ValueError('backend must be auto, torch, or triton')
     if type(output_tile) is not int or output_tile not in (32, 64, 128):
         raise ValueError('output_tile must be 32, 64, or 128')
+    if type(autotune) is not bool:
+        raise ValueError('autotune must be boolean')
     if activation not in ('identity', 'relu', 'relu2', 'silu', 'gelu'):
         raise ValueError('unsupported activation')
     if not math.isfinite(eps) or eps <= 0 or not math.isfinite(norm_eps) or norm_eps <= 0:
@@ -89,8 +91,8 @@ def _reference(z_tr, v, z_tl, bias, valid, eps, norm_eps, causal, normalize, act
     return out.to(z_tr.dtype)
 
 
-def _dispatch(z_tr, v, z_tl, bias, valid, eps, norm_eps, causal, normalize, activation, backend, output_tile):
-    _validate(z_tr, v, z_tl, bias, valid, eps, norm_eps, activation, backend, output_tile)
+def _dispatch(z_tr, v, z_tl, bias, valid, eps, norm_eps, causal, normalize, activation, backend, output_tile, autotune):
+    _validate(z_tr, v, z_tl, bias, valid, eps, norm_eps, activation, backend, output_tile, autotune)
     needs_grad = torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in (z_tr, v, z_tl, bias))
     supported = (_mix is not None and z_tr.is_cuda and torch.version.hip is None
@@ -109,34 +111,37 @@ def _dispatch(z_tr, v, z_tl, bias, valid, eps, norm_eps, causal, normalize, acti
                z_tl.contiguous() if z_tl is not None else None,
                bias.contiguous() if bias is not None else None,
                valid.contiguous() if valid is not None else None,
-               eps, causal, normalize, activation, output_tile)
+               eps, causal, normalize, activation, output_tile, autotune)
 
 
 def avey(z_tr: torch.Tensor, v: torch.Tensor, *, z_tl=None, bias=None,
          valid=None, causal=True, norm_eps=1e-12, activation='identity', backend='auto',
-         output_tile=32):
+         output_tile=32, autotune=False):
     """z_tl * activation(((v * cosine(z_tr, z_tr)) masked) @ z_tr + bias).
 
     Causal masking includes the diagonal. `valid` masks both query and key
     positions; invalid output rows are zero, including after bias/gating.
     `bias` has shape [features]; `z_tl`, if present, has the same shape as z_tr.
     `output_tile` selects an experimental Triton feature tile (32/64/128).
-    It does not change reference math or automatically select a faster kernel.
+    With `autotune=True`, Triton benchmarks 16 configurations on first use and
+    reuses the winner in this process; `output_tile` is then ignored. Warm up
+    outside CUDA-graph capture. CPU/autograd fallback keeps reference math.
     """
     if v is None:
         raise ValueError('Avey requires the learned V matrix (v)')
     return _dispatch(z_tr, v, z_tl, bias, valid, 1e-6, norm_eps,
-                     causal, False, activation, backend, output_tile)
+                     causal, False, activation, backend, output_tile, autotune)
 
 
 def avey_b(z_tr: torch.Tensor, *, z_tl=None, bias=None, valid=None, eps=1e-6,
-           norm_eps=1e-12, activation='identity', backend='auto', output_tile=32):
+           norm_eps=1e-12, activation='identity', backend='auto', output_tile=32, autotune=False):
     """Avey-B dynamic mixing: z_tl * activation((S @ z_tr)/(sum(S)+eps) + bias).
 
     S is cosine similarity with invalid keys zeroed. Signed similarities are
     preserved; denominators are not clamped or replaced with softmax.
     GELU, when requested, uses PyTorch's tanh approximation.
     `output_tile` selects the Triton output-feature tile: 32 (default), 64, or 128.
+    `autotune=True` overrides it with a measured configuration, as in `avey`.
     """
     return _dispatch(z_tr, None, z_tl, bias, valid, eps, norm_eps,
-                     False, True, activation, backend, output_tile)
+                     False, True, activation, backend, output_tile, autotune)

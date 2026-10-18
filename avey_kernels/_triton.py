@@ -3,8 +3,8 @@
 Normalization is a separate linear-size pass. Each program computes a tile of
 output rows/features and streams over key tiles, never storing a C x C tensor.
 Feature tiling bounds register usage, at the cost of recomputing similarity tiles
-for each output-feature block. This initial implementation prioritizes FP32
-numerics; it is not a tuned tensor-core implementation for low-precision input.
+for each output-feature block. Arithmetic remains FP32 for low-precision
+inputs; autotuning changes tiling and launch settings, not arithmetic precision.
 """
 
 from typing import Optional
@@ -29,6 +29,7 @@ def _mix_kernel(
     HAS_BIAS: tl.constexpr, HAS_VALID: tl.constexpr,
     CAUSAL: tl.constexpr, NORMALIZE: tl.constexpr, ACT: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, BD: tl.constexpr,
+    BATCH: tl.constexpr = 1, DEVICE: tl.constexpr = -1,
 ):
     batch = tl.program_id(1)
     n_feature_tiles = tl.cdiv(D_PRIME, BD)
@@ -94,12 +95,30 @@ def _mix_kernel(
              accumulator, (rows[:, None] < C) & (features[None, :] < D_PRIME))
 
 
+# Keep the raw JIT kernel available for fixed launches and offline compilation.
+# All candidates overwrite Out completely; no reset hooks or input mutation.
+_AUTOTUNE_CONFIGS = [
+    triton.Config(dict(BM=bm, BN=bn, BK=32, BD=bd), num_warps=4, num_stages=3)
+    for bm in (16, 32) for bn in (32, 64) for bd in (32, 64, 128)
+] + [
+    triton.Config(dict(BM=bm, BN=bn, BK=32, BD=128), num_warps=8, num_stages=2)
+    for bm in (16, 32) for bn in (32, 64)
+]
+_mix_autotuned = triton.autotune(
+    configs=_AUTOTUNE_CONFIGS,
+    # Triton also appends tensor dtypes to its in-memory key. DEVICE separates
+    # devices in a multi-GPU process; BATCH matters for launch occupancy.
+    key=['BATCH', 'DEVICE', 'C', 'D_PRIME', 'EPS', 'HAS_V', 'HAS_Z_TL',
+         'HAS_BIAS', 'HAS_VALID', 'CAUSAL', 'NORMALIZE', 'ACT'],
+)(_mix_kernel)
+
+
 @triton_op('avey_kernels::mix', mutates_args={})
 def mix(
     z_tr: torch.Tensor, z_tr_norm: torch.Tensor, v: Optional[torch.Tensor],
     z_tl: Optional[torch.Tensor], bias: Optional[torch.Tensor],
     valid: Optional[torch.Tensor], eps: float, causal: bool,
-    normalize: bool, activation: str, output_tile: int = 32,
+    normalize: bool, activation: str, output_tile: int = 32, autotune: bool = False,
 ) -> torch.Tensor:
     # Dynamo may generalize a changing scalar argument to a backed SymInt.
     # BD and the launch grid must remain compile-time constants: converting
@@ -112,12 +131,17 @@ def mix(
     batch, c, d_prime = z_tr.shape
     activation_id = {'identity': 0, 'relu': 1, 'relu2': 2, 'silu': 3, 'gelu': 4}[activation]
     # Dummy pointers have dead loads: constexpr flags remove unused arguments.
-    wrap_triton(_mix_kernel)[(triton.cdiv(c, 16) * triton.cdiv(d_prime, output_tile), batch)](
-        z_tr, z_tr_norm, v if v is not None else z_tr,
-        z_tl if z_tl is not None else z_tr, bias if bias is not None else z_tr,
-        valid if valid is not None else z_tr, out,
-        c, d_prime, eps, v is not None, z_tl is not None,
-        bias is not None, valid is not None, causal, normalize, activation_id,
-        16, 32, 32, output_tile, num_warps=4,
-    )
+    args = (z_tr, z_tr_norm, v if v is not None else z_tr,
+            z_tl if z_tl is not None else z_tr, bias if bias is not None else z_tr,
+            valid if valid is not None else z_tr, out,
+            c, d_prime, eps, v is not None, z_tl is not None,
+            bias is not None, valid is not None, causal, normalize, activation_id)
+    if autotune:
+        def grid(meta):
+            return (triton.cdiv(c, meta['BM']) * triton.cdiv(d_prime, meta['BD']), batch)
+        wrap_triton(_mix_autotuned)[grid](
+            *args, BATCH=batch, DEVICE=z_tr.device.index if z_tr.device.index is not None else -1)
+    else:
+        wrap_triton(_mix_kernel)[(triton.cdiv(c, 16) * triton.cdiv(d_prime, output_tile), batch)](
+            *args, 16, 32, 32, output_tile, num_warps=4)
     return out

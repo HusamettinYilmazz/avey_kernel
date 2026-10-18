@@ -1,6 +1,7 @@
 """Profile normalization, mixing, and full contextualizers on NVIDIA SM80+.
 
 python3 -m benchmarks.profile_contextualizer --output-dir gpu-profile
+Autotune: add --autotune --output-tiles 128 for a fixed-baseline comparison.
 Compare tiles: add --output-tiles 32 64 128 --output-dir gpu-profile-tiles
 All compilation/warmup precedes timing. Inductor's automatic CUDA graphs are
 disabled; every case is measured with ordinary launches and explicit replay.
@@ -39,7 +40,7 @@ class ProfileCase:
 
 
 def build_cases(z_tr, v, z_tl, bias, *, include_triton=True, compile_functions=True,
-                output_tiles=(32,)):
+                output_tiles=(32,), autotune=False):
     """Mix-only cases consume a precomputed normalized buffer, excluding its cost."""
     if (not output_tiles or len(set(output_tiles)) != len(output_tiles)
             or any(type(tile) is not int or tile not in (32, 64, 128) for tile in output_tiles)):
@@ -87,6 +88,17 @@ def build_cases(z_tr, v, z_tl, bias, *, include_triton=True, compile_functions=T
 
                 add_pair(f'{name}/fused/bd{output_tile}', fused, expected, output_tile)
                 add_pair(f'{name}/mix_only/bd{output_tile}', mixing_only, expected, output_tile)
+            if autotune:
+                def tuned_fused(op=op, extra=extra):
+                    return op(z_tr, *extra, z_tl=z_tl, bias=bias,
+                              backend='triton', autotune=True)
+
+                def tuned_mixing(is_avey=(name == 'avey')):
+                    return mix(z_tr, z_tr_norm, v if is_avey else None, z_tl, bias,
+                               None, 1e-6, is_avey, not is_avey, 'identity', 32, True)
+
+                add_pair(f'{name}/fused/autotuned', tuned_fused, expected)
+                add_pair(f'{name}/mix_only/autotuned', tuned_mixing, expected)
     return cases
 
 
@@ -183,6 +195,8 @@ def main():
     parser.add_argument('--dtype', choices=('float32', 'float16', 'bfloat16'), default='bfloat16')
     parser.add_argument('--output-tiles', type=int, nargs='+', choices=(32, 64, 128), default=[32],
                         help='output-feature tile widths to compare (default: 32)')
+    parser.add_argument('--autotune', action='store_true',
+                        help='also benchmark autotuned kernels; first-use tuning precedes timing')
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--iterations', type=int, default=100)
     parser.add_argument('--repeats', type=int, default=5)
@@ -213,7 +227,7 @@ def main():
                     triton=triton.__version__, cuda=torch.version.cuda,
                     gpu=torch.cuda.get_device_name(), capability=torch.cuda.get_device_capability(),
                     shape=list(z_tr.shape), dtype=args.dtype, seed=42,
-                    output_tiles=args.output_tiles,
+                    output_tiles=args.output_tiles, autotune=args.autotune,
                     automatic_cudagraphs=False, compiled_cases=not args.no_compile,
                     warmup=args.warmup, iterations=args.iterations, repeats=args.repeats,
                     trace_steps=args.trace_steps, matmul_precision='highest')
@@ -228,7 +242,7 @@ def main():
     print(json.dumps(metadata), flush=True)
     with torch.inference_mode():
         cases = build_cases(z_tr, v, z_tl, bias, compile_functions=not args.no_compile,
-                            output_tiles=args.output_tiles)
+                            output_tiles=args.output_tiles, autotune=args.autotune)
         # Warm every case before any measurement. Capture, compilation, and
         # checking results must never enter the timed repetition loop.
         for case in cases:

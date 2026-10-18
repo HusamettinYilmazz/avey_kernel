@@ -32,6 +32,17 @@ class ProfilingTests(unittest.TestCase):
                     self.assertEqual(len(matches), 1)
                     self.assertEqual(matches[0].output_tile, tile)
 
+    def test_autotuned_cases_are_distinct_from_fixed_baseline(self):
+        from benchmarks.profile_contextualizer import build_cases
+        x = torch.ones(1, 2, 3)
+        cases = build_cases(x, torch.ones(2, 2), x, torch.zeros(3),
+                            compile_functions=False, output_tiles=(128,), autotune=True)
+        names = {case.name for case in cases}
+        for arch in ('avey', 'avey_b'):
+            for component in ('fused', 'mix_only'):
+                self.assertIn(f'{arch}/{component}/autotuned/eager', names)
+                self.assertIn(f'{arch}/{component}/bd128/eager', names)
+
     def test_component_cases_follow_the_same_math_as_full_calls(self):
         from benchmarks.profile_contextualizer import build_cases
 

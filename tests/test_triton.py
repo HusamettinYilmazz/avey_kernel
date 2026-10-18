@@ -14,6 +14,32 @@ CAN_RUN = INTERPRET or torch.cuda.is_available()
 
 @unittest.skipUnless(CAN_RUN, 'requires CUDA or TRITON_INTERPRET=1')
 class TiledKernelTests(unittest.TestCase):
+    def test_every_autotune_candidate_matches_reference(self):
+        import triton
+        from avey_kernels._triton import _mix_kernel, _AUTOTUNE_CONFIGS
+        device = 'cpu' if INTERPRET else 'cuda'
+        torch.manual_seed(31)
+        x = torch.rand(2, 35, 133, device=device)
+        norm = F.normalize(x, dim=-1)
+        v = torch.randn(35, 35, device=device)
+        valid = torch.ones(2, 35, dtype=torch.bool, device=device)
+        valid[1] = False
+        x[1] = float('nan')
+        for weighted in (False, True):
+            expected = (avey(x, v, valid=valid, z_tl=x, bias=x[0, 0], activation='gelu',
+                             backend='torch') if weighted else
+                        avey_b(x, valid=valid, z_tl=x, bias=x[0, 0], activation='gelu',
+                               backend='torch'))
+            for config in _AUTOTUNE_CONFIGS:
+                with self.subTest(weighted=weighted, config=str(config)):
+                    out = torch.empty_like(x)
+                    grid = (triton.cdiv(35, config.kwargs['BM']) *
+                            triton.cdiv(133, config.kwargs['BD']), 2)
+                    _mix_kernel[grid](x, norm, v, x, x[0, 0], valid, out,
+                                      35, 133, 1e-6, weighted, True, True, True,
+                                      weighted, not weighted, 4, **config.all_kwargs())
+                    torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
     def test_output_tile_variants_match_reference(self):
         from avey_kernels._triton import mix
 
