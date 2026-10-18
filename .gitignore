@@ -6,5 +6,4 @@ dist/
 .venv/
 papers/
 README.md
-gpu-profile/
-gpu-profile-*/
+gpu-logs/
