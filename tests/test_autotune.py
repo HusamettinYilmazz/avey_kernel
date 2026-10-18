@@ -45,7 +45,11 @@ class AutotuneTests(unittest.TestCase):
                 torch.testing.assert_close(fn(), expected, atol=1e-5, rtol=1e-5)
                 compiled = torch.compile(fn, fullgraph=True,
                                          options={'triton.cudagraphs': False})
-                torch.testing.assert_close(compiled(), expected, atol=1e-5, rtol=1e-5)
+                # Do not silently accept access-analysis failures and the
+                # resulting conservative input-cloning fallback.
+                with self.assertNoLogs('torch._higher_order_ops.triton_kernel_wrap',
+                                       level='WARNING'):
+                    torch.testing.assert_close(compiled(), expected, atol=1e-5, rtol=1e-5)
                 for call in (fn, compiled):
                     measure_case(ProfileCase('autotuned', call, expected), 'cuda_graph',
                                  warmup=1, iterations=2, repeats=1)

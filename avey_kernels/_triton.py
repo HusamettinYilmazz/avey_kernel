@@ -39,14 +39,16 @@ def _mix_kernel(
     features = feature_tile * BD + tl.arange(0, BD)
     row_valid = rows < C
     if HAS_VALID:
-        row_valid = row_valid & tl.load(Valid + batch * C + rows, rows < C, other=False)
+        # Access analysis may represent torch.bool storage as *i8. Convert
+        # loaded bytes to predicates before combining them with load masks.
+        row_valid = row_valid & (tl.load(Valid + batch * C + rows, rows < C, other=0) != 0)
     accumulator = tl.full((BM, BD), 0, tl.float32)
     denominator = tl.full((BM,), 0, tl.float32)
     for key_start in range(tl.cdiv(C, BN)):
         keys = key_start * BN + tl.arange(0, BN)
         key_valid = keys < C
         if HAS_VALID:
-            key_valid = key_valid & tl.load(Valid + batch * C + keys, keys < C, other=False)
+            key_valid = key_valid & (tl.load(Valid + batch * C + keys, keys < C, other=0) != 0)
         s_tile = tl.full((BM, BN), 0, tl.float32)
         for feature_start in range(tl.cdiv(D_PRIME, BK)):
             inner = feature_start * BK + tl.arange(0, BK)
