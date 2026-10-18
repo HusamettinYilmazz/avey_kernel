@@ -9,6 +9,29 @@ import torch
 @unittest.skipIf(os.environ.get('TRITON_INTERPRET') == '1',
                  'fake execution uses JIT wrapping, not interpreter execution')
 class SymbolicTileTests(unittest.TestCase):
+    def test_lowered_launch_explicitly_supplies_all_kernel_arguments(self):
+        import inspect
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from avey_kernels._triton import mix, _mix_kernel, _AUTOTUNE_CONFIGS
+
+        # Trace the implementation itself so this reaches wrap_triton rather
+        # than stopping at the opaque custom-op boundary. No GPU is executed.
+        implementation = inspect.getclosurevars(mix._init_fn).nonlocals['fn']
+        for autotune, width in ((False, 32), (False, 64), (False, 128), (True, 32)):
+            with self.subTest(autotune=autotune, width=width):
+                def fn(x):
+                    return implementation(x, x, None, None, None, None,
+                                          1e-6, False, True, 'identity', width, autotune)
+                graph = make_fx(fn, tracing_mode='fake')(torch.empty(2, 35, 37))
+                launches = [node for node in graph.graph.nodes
+                            if 'triton_kernel_wrapper_mutation' in str(node.target)]
+                self.assertEqual(len(launches), 1)
+                arguments = dict(launches[0].kwargs['kwargs'])
+                self.assertEqual(arguments.get('BATCH'), 2)
+                self.assertEqual(arguments.get('DEVICE'), -1)
+                tuned_names = set(_AUTOTUNE_CONFIGS[0].kwargs) if autotune else set()
+                self.assertEqual(set(arguments) | tuned_names, set(_mix_kernel.arg_names))
+
     def test_dynamo_accepts_changing_symbolic_tile_widths(self):
         from torch._subclasses.fake_tensor import FakeTensorMode
         from avey_kernels._triton import mix

@@ -143,5 +143,8 @@ def mix(
             *args, BATCH=batch, DEVICE=z_tr.device.index if z_tr.device.index is not None else -1)
     else:
         wrap_triton(_mix_kernel)[(triton.cdiv(c, 16) * triton.cdiv(d_prime, output_tile), batch)](
-            *args, 16, 32, 32, output_tile, num_warps=4)
+            # Inductor's argument analysis does not fill in JIT defaults.
+            *args, 16, 32, 32, output_tile, BATCH=batch,
+            DEVICE=z_tr.device.index if z_tr.device.index is not None else -1,
+            num_warps=4)
     return out
