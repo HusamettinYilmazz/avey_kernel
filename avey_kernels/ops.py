@@ -123,7 +123,7 @@ def avey(z_tr: torch.Tensor, v: torch.Tensor, *, z_tl=None, bias=None,
     positions; invalid output rows are zero, including after bias/gating.
     `bias` has shape [features]; `z_tl`, if present, has the same shape as z_tr.
     `output_tile` selects an experimental Triton feature tile (32/64/128).
-    With `autotune=True`, Triton benchmarks 16 configurations on first use and
+    With `autotune=True`, Triton benchmarks tile/ordering configurations on first use and
     reuses the winner in this process; `output_tile` is then ignored. Warm up
     outside CUDA-graph capture. CPU/autograd fallback keeps reference math.
     """

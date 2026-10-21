@@ -23,7 +23,7 @@ class OfflineCudaCompilationTests(unittest.TestCase):
                 constants = dict(C=35, D_PRIME=37, EPS=1e-6, HAS_V=weighted,
                                  HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=True,
                                  CAUSAL=weighted, NORMALIZE=not weighted, ACT=3,
-                                 BM=16, BN=32, BK=32, BD=32, BATCH=2, DEVICE=0)
+                                 BM=16, BN=32, BK=32, BD=32, BATCH=2, DEVICE=0, GROUP_M=1)
                 kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
                                         target=GPUTarget('cuda', 86, 32),
                                         options={'num_warps': 4})
@@ -66,7 +66,7 @@ class OfflineCudaCompilationTests(unittest.TestCase):
                                          HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=False,
                                          CAUSAL=weighted, NORMALIZE=not weighted,
                                          ACT=0, BM=16, BN=32, BK=32, BD=output_tile,
-                                         BATCH=1, DEVICE=-1)
+                                         BATCH=1, DEVICE=-1, GROUP_M=1)
                         kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
                                                 target=GPUTarget('cuda', 86, 32),
                                                 options={'num_warps': 4})
@@ -89,7 +89,7 @@ class OfflineCudaCompilationTests(unittest.TestCase):
                                      HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=True,
                                      CAUSAL=weighted, NORMALIZE=not weighted,
                                      ACT=4, BM=16, BN=32, BK=32, BD=32,
-                                     BATCH=1, DEVICE=-1)
+                                     BATCH=1, DEVICE=-1, GROUP_M=1)
                     kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
                                             target=GPUTarget('cuda', 80, 32),
                                             options={'num_warps': 4})

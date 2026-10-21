@@ -22,6 +22,20 @@ def _stable_sigmoid(x):
 
 
 @triton.jit
+def _tile_ids(pid, n_query_tiles, n_feature_tiles, GROUP_M: tl.constexpr):
+    if GROUP_M == 1:
+        return pid // n_feature_tiles, pid % n_feature_tiles
+    programs_per_group = GROUP_M * n_feature_tiles
+    group_id = pid // programs_per_group
+    first_query = group_id * GROUP_M
+    group_size = tl.minimum(n_query_tiles - first_query, GROUP_M)
+    pid_in_group = pid % programs_per_group
+    query_tile = first_query + pid_in_group % group_size
+    feature_tile = pid_in_group // group_size
+    return query_tile, feature_tile
+
+
+@triton.jit
 def _mix_kernel(
     Z_TR, Z_TR_NORM, V, Z_TL, Bias, Valid, Out,
     C: tl.constexpr, D_PRIME: tl.constexpr, EPS: tl.constexpr,
@@ -29,12 +43,12 @@ def _mix_kernel(
     HAS_BIAS: tl.constexpr, HAS_VALID: tl.constexpr,
     CAUSAL: tl.constexpr, NORMALIZE: tl.constexpr, ACT: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, BD: tl.constexpr,
-    BATCH: tl.constexpr = 1, DEVICE: tl.constexpr = -1,
+    BATCH: tl.constexpr = 1, DEVICE: tl.constexpr = -1, GROUP_M: tl.constexpr = 1,
 ):
     batch = tl.program_id(1)
     n_feature_tiles = tl.cdiv(D_PRIME, BD)
-    query_tile = tl.program_id(0) // n_feature_tiles
-    feature_tile = tl.program_id(0) % n_feature_tiles
+    query_tile, feature_tile = _tile_ids(
+        tl.program_id(0), tl.cdiv(C, BM), n_feature_tiles, GROUP_M)
     rows = query_tile * BM + tl.arange(0, BM)
     features = feature_tile * BD + tl.arange(0, BD)
     row_valid = rows < C
@@ -98,13 +112,16 @@ def _mix_kernel(
 
 
 # Keep the raw JIT kernel available for fixed launches and offline compilation.
+# Group 1 retains query-major order; groups 4/8 encourage input cache reuse.
+# This changes the mapping, not execution order or similarity recomputation.
 # All candidates overwrite Out completely; no reset hooks or input mutation.
 _AUTOTUNE_CONFIGS = [
-    triton.Config(dict(BM=bm, BN=bn, BK=32, BD=bd), num_warps=4, num_stages=3)
+    triton.Config(dict(BM=bm, BN=bn, BK=32, BD=bd, GROUP_M=group), num_warps=4, num_stages=3)
     for bm in (16, 32) for bn in (32, 64) for bd in (32, 64, 128)
+    for group in (1, 4, 8)
 ] + [
-    triton.Config(dict(BM=bm, BN=bn, BK=32, BD=128), num_warps=8, num_stages=2)
-    for bm in (16, 32) for bn in (32, 64)
+    triton.Config(dict(BM=bm, BN=bn, BK=32, BD=128, GROUP_M=group), num_warps=8, num_stages=2)
+    for bm in (16, 32) for bn in (32, 64) for group in (1, 4, 8)
 ]
 _mix_autotuned = triton.autotune(
     configs=_AUTOTUNE_CONFIGS,
@@ -148,5 +165,5 @@ def mix(
             # Inductor's argument analysis does not fill in JIT defaults.
             *args, 16, 32, 32, output_tile, BATCH=batch,
             DEVICE=z_tr.device.index if z_tr.device.index is not None else -1,
-            num_warps=4)
+            GROUP_M=1, num_warps=4)
     return out

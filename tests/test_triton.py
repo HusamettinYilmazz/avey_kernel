@@ -12,8 +12,35 @@ INTERPRET = os.environ.get('TRITON_INTERPRET') == '1'
 CAN_RUN = INTERPRET or torch.cuda.is_available()
 
 
+if CAN_RUN:
+    import triton
+    import triton.language as tl
+    from avey_kernels._triton import _tile_ids
+
+    @triton.jit
+    def _record_order(Out, NQ: tl.constexpr, NF: tl.constexpr, GROUP_M: tl.constexpr):
+        pid = tl.program_id(0)
+        query, feature = _tile_ids(pid, NQ, NF, GROUP_M)
+        tl.store(Out + pid, query * NF + feature)
+
+
 @unittest.skipUnless(CAN_RUN, 'requires CUDA or TRITON_INTERPRET=1')
 class TiledKernelTests(unittest.TestCase):
+    def test_grouped_ordering_covers_partial_groups_without_duplicates(self):
+        device = 'cpu' if INTERPRET else 'cuda'
+        expected_group4 = [0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11, 12, 13, 14]
+        for nq, nf in ((5, 3), (2, 5), (5, 1), (1, 3)):
+            for group in (1, 4, 8):
+                with self.subTest(nq=nq, nf=nf, group=group):
+                    order = torch.full((nq * nf,), -1, device=device, dtype=torch.int32)
+                    _record_order[(nq * nf,)](order, nq, nf, group)
+                    values = order.cpu().tolist()
+                    self.assertEqual(sorted(values), list(range(nq * nf)))
+                    if group == 1 or nf == 1:
+                        self.assertEqual(values, list(range(nq * nf)))
+                    if (nq, nf, group) == (5, 3, 4):
+                        self.assertEqual(values, expected_group4)
+
     def test_every_autotune_candidate_matches_reference(self):
         import triton
         from avey_kernels._triton import _mix_kernel, _AUTOTUNE_CONFIGS
