@@ -51,6 +51,49 @@ class OrderingComparisonTests(unittest.TestCase):
                         torch.testing.assert_close(case.fn(), case.expected, atol=1e-5,
                                                    rtol=max(1e-5, torch.finfo(dtype).eps))
 
+    def test_tuned_comparison_shares_q_and_keeps_one_stage_baseline(self):
+        from unittest.mock import patch
+        from benchmarks import compare_ordering as bench
+        for weighted in (False, True):
+            x = torch.rand(1, 3, 5)
+            v = torch.ones(3, 3) if weighted else None
+            captures = []
+            def call(x, q, v, gate, bias, *options):
+                captures.append((q, options))
+                return (bench.torch_causal_mix(x, q, v, gate, bias) if v is not None
+                        else bench.torch_dynamic_mix(x, q, gate, bias))
+            with patch.object(bench, 'mix_fixed_order', side_effect=call), \
+                 patch('avey_kernels._triton.mix', side_effect=call):
+                cases = bench.build_tuned_cases(x, v, x, x[0, 0], compile_functions=False)
+                self.assertEqual([c.name.split('/')[2] for c in cases],
+                                 ['w4_s1', 'autotuned', 'pytorch'])
+                for case in cases:
+                    torch.testing.assert_close(case.fn(), case.expected)
+            self.assertEqual(captures[0][0].data_ptr(), captures[1][0].data_ptr())
+            self.assertEqual(captures[0][1], (1, True, 32, 128, 4, 1))
+            self.assertEqual(captures[1][1], (None, 1e-6, weighted, not weighted, 'identity', 128, True))
+
+    def test_tuned_rounds_pair_against_one_stage_baseline(self):
+        from unittest.mock import patch
+        from benchmarks.compare_ordering import measure_stability
+        from benchmarks.profile_contextualizer import ProfileCase
+        cases = [ProfileCase(f'avey/mix_only/{label}/compiled', None, None)
+                 for label in ('w4_s1', 'autotuned', 'pytorch')]
+        def timing(case, mode, **kwargs):
+            t = {'w4_s1': 300., 'autotuned': 250., 'pytorch': 200.}[case.name.split('/')[2]]
+            return dict(case=case.name, gpu_span_us=t)
+        with patch('benchmarks.compare_ordering.measure_case', side_effect=timing):
+            rows = list(measure_stability(cases, warmup=1, iterations=1, repeats=1,
+                                          baseline='w4_s1'))
+        self.assertEqual(len(rows), 18)
+        for row in rows:
+            label = row['case'].split('/')[2]
+            self.assertEqual(row['speedup_vs_w4_s1'],
+                             {'w4_s1': 1., 'autotuned': 1.2, 'pytorch': 1.5}[label])
+            if label == 'autotuned':
+                self.assertIsNone(row['num_warps'])
+                self.assertIsNone(row['num_stages'])
+
     def test_stability_balances_order_and_pairs_each_round(self):
         from unittest.mock import patch
         from benchmarks.compare_ordering import measure_stability
@@ -218,7 +261,7 @@ class OrderingComparisonTests(unittest.TestCase):
                 self.assertEqual(args['CAUSAL'], weighted)
                 self.assertEqual(args['NORMALIZE'], not weighted)
                 # wrap_triton represents explicit launch options with a
-                # singleton configuration, not the 48-candidate tuner.
+                # singleton configuration rather than the production autotuner.
                 kernel = kernel_side_table.get_kernel(launches[0].kwargs['kernel_idx'])
                 self.assertEqual(len(kernel.configs), 1)
                 self.assertEqual(kernel.configs[0].num_warps, 4)

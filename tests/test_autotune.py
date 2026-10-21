@@ -6,6 +6,22 @@ from avey_kernels import avey, avey_b
 
 
 class AutotuneTests(unittest.TestCase):
+    def test_one_stage_candidates_extend_existing_search_without_duplicates(self):
+        from itertools import product
+        from avey_kernels._triton import _AUTOTUNE_CONFIGS
+        def key(config):
+            return (config.kwargs['BM'], config.kwargs['BN'], config.kwargs['BD'],
+                    config.kwargs['GROUP_M'], config.num_warps, config.num_stages)
+        actual = {key(c) for c in _AUTOTUNE_CONFIGS}
+        old = {(bm, bn, bd, group, 4, 3)
+               for bm, bn, bd, group in product((16, 32), (32, 64), (32, 64, 128), (1, 4, 8))}
+        old |= {(bm, bn, 128, group, 8, 2)
+                for bm, bn, group in product((16, 32), (32, 64), (1, 4, 8))}
+        added = {(bm, bn, bd, group, 4, 1)
+                 for bm, bn, bd, group in product((16, 32), (32, 64), (32, 64, 128), (1, 4, 8))}
+        self.assertEqual(actual, old | added)
+        self.assertEqual(len(_AUTOTUNE_CONFIGS), len(actual))
+
     def test_reference_fallback_preserves_autograd(self):
         x = torch.rand(1, 5, 7, requires_grad=True)
         result = avey_b(x, autotune=True)

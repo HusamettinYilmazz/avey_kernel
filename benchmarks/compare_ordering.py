@@ -7,7 +7,8 @@ Add --comparison causal to compare full key traversal against skipping future ti
 Add --comparison tiles to sweep BM=16/32 and BD=64/128/256 with causal skipping.
 Add --comparison launch to sweep warps=4/8 and stages=1/2/3 at BM32/BD128.
 Add --comparison stability to compare w4_s3, w4_s1, and PyTorch in all six orders.
-Launch and stability comparisons accept --operation avey_b for dynamic Avey-B mixing.
+Add --comparison tuned to compare autotuned mixing, w4_s1, and PyTorch in all six orders.
+Launch, stability, and tuned comparisons accept --operation avey_b for dynamic Avey-B mixing.
 
 python3 -m benchmarks.compare_ordering --output-dir gpu-profile-ordering-fixed
 """
@@ -26,7 +27,7 @@ import triton
 from torch.library import triton_op, wrap_triton
 
 from avey_kernels import avey, avey_b
-from avey_kernels._triton import _mix_kernel
+from avey_kernels._triton import _mix_kernel, _AUTOTUNE_CONFIGS
 from benchmarks.profile_contextualizer import ProfileCase, _check, measure_case
 
 
@@ -200,7 +201,36 @@ def build_stability_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
                               configs=STABILITY_CONFIGS)
 
 
-def measure_stability(cases, *, warmup, iterations, repeats):
+def build_tuned_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
+    """Compare the enlarged search with the fixed one-stage baseline and PyTorch."""
+    from avey_kernels._triton import mix
+    z_tr_norm = F.normalize(z_tr.float(), dim=-1, eps=1e-12).contiguous()
+    name = 'avey' if v is not None else 'avey_b'
+    expected = (avey(z_tr, v, z_tl=z_tl, bias=bias, backend='torch') if v is not None
+                else avey_b(z_tr, z_tl=z_tl, bias=bias, backend='torch'))
+
+    def fixed():
+        return mix_fixed_order(z_tr, z_tr_norm, v, z_tl, bias, 1, True, 32, 128, 4, 1)
+
+    def tuned():
+        return mix(z_tr, z_tr_norm, v, z_tl, bias, None, 1e-6,
+                   v is not None, v is None, 'identity', 128, True)
+
+    cases = []
+    suffix = 'compiled' if compile_functions else 'eager'
+    for label, fn in (('w4_s1', fixed), ('autotuned', tuned)):
+        if compile_functions:
+            fn = torch.compile(fn, fullgraph=True, options={
+                'max_autotune': label == 'autotuned',
+                'coordinate_descent_tuning': False, 'triton.cudagraphs': False,
+            })
+        cases.append(ProfileCase(f'{name}/mix_only/{label}/{suffix}', fn, expected,
+                                 128 if label == 'w4_s1' else None))
+    cases.append(_pytorch_case(z_tr, z_tr_norm, v, z_tl, bias, expected, compile_functions))
+    return cases
+
+
+def measure_stability(cases, *, warmup, iterations, repeats, baseline='w4_s3'):
     """Six balanced orders, with speedups paired within each round."""
     for round_number, order in enumerate(permutations(cases), start=1):
         rows = []
@@ -209,13 +239,13 @@ def measure_stability(cases, *, warmup, iterations, repeats):
                                   iterations=iterations, repeats=repeats)
             label = case.name.split('/')[2]
             result.update(round=round_number, position=position,
-                          num_warps=None if label == 'pytorch' else 4,
-                          num_stages=None if label == 'pytorch' else int(label.split('_s')[1]))
+                          num_warps=int(label.split('_')[0][1:]) if label.startswith('w') else None,
+                          num_stages=int(label.split('_s')[1]) if label.startswith('w') else None)
             rows.append(result)
         times = {r['case'].split('/')[2]: r['gpu_span_us'] for r in rows}
         for result in rows:
             result['speedup_vs_pytorch'] = times['pytorch'] / result['gpu_span_us']
-            result['speedup_vs_w4_s3'] = times['w4_s3'] / result['gpu_span_us']
+            result[f'speedup_vs_{baseline}'] = times[baseline] / result['gpu_span_us']
             yield result
 
 
@@ -236,7 +266,7 @@ def summarize_stability(results):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--comparison', choices=('ordering', 'causal', 'tiles', 'launch', 'stability'), default='ordering')
+    parser.add_argument('--comparison', choices=('ordering', 'causal', 'tiles', 'launch', 'stability', 'tuned'), default='ordering')
     parser.add_argument('--operation', choices=('avey', 'avey_b'), default='avey')
     parser.add_argument('--batch', type=int, default=8)
     parser.add_argument('--context', type=int, default=256)
@@ -247,8 +277,8 @@ def main():
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--output-dir', type=Path, default=None)
     args = parser.parse_args()
-    if args.operation == 'avey_b' and args.comparison not in ('launch', 'stability'):
-        parser.error('--operation avey_b supports --comparison launch or stability')
+    if args.operation == 'avey_b' and args.comparison not in ('launch', 'stability', 'tuned'):
+        parser.error('--operation avey_b supports --comparison launch, stability, or tuned')
     if min(args.batch, args.context, args.features, args.warmup,
            args.iterations, args.repeats) < 1:
         parser.error('dimensions and iteration counts must be positive')
@@ -270,19 +300,22 @@ def main():
                     triton=triton.__version__, cuda=torch.version.cuda,
                     gpu=torch.cuda.get_device_name(), capability=torch.cuda.get_device_capability(),
                     shape=[args.batch, args.context, args.features], dtype=args.dtype,
-                    seed=42, fixed_config=fixed_config,
+                    seed=42, fixed_config=None if args.comparison == 'tuned' else fixed_config,
+                    baseline_config=({**FIXED_CONFIG, 'num_stages': 1}
+                                     if args.comparison == 'tuned' else None),
+                    autotune_candidates=len(_AUTOTUNE_CONFIGS) if args.comparison == 'tuned' else 0,
                     tile_configs=list(TILE_CONFIGS) if args.comparison == 'tiles' else None,
                     launch_configs=(list(LAUNCH_CONFIGS) if args.comparison == 'launch' else
                                     list(STABILITY_CONFIGS) if args.comparison == 'stability' else None),
-                    rounds=6 if args.comparison == 'stability' else 1,
+                    rounds=6 if args.comparison in ('stability', 'tuned') else 1,
                     comparison=args.comparison,
                     operation='both' if args.comparison == 'ordering' else args.operation,
                     causal=None if args.comparison == 'ordering' else args.operation == 'avey',
                     signed_row_normalization=(None if args.comparison == 'ordering'
                                               else args.operation == 'avey_b'),
-                    group_sizes=[1, 4, 8] if args.comparison == 'ordering' else [1],
+                    group_sizes=[1, 4, 8] if args.comparison in ('ordering', 'tuned') else [1],
                     skip_causal_options=[False, True] if args.comparison == 'causal' else [True],
-                    autotune=False, pytorch_max_autotune=args.comparison != 'ordering',
+                    autotune=args.comparison == 'tuned', pytorch_max_autotune=args.comparison != 'ordering',
                     normalization_timed=False, mode='cuda_graph',
                     warmup=args.warmup, iterations=args.iterations, repeats=args.repeats,
                     matmul_precision='highest')
@@ -297,13 +330,14 @@ def main():
         gate, bias = torch.rand_like(x), torch.rand(args.features, device='cuda', dtype=x.dtype)
         builder = {'ordering': build_ordering_cases, 'causal': build_causal_cases,
                    'tiles': build_tile_cases, 'launch': build_launch_cases,
-                   'stability': build_stability_cases}[args.comparison]
+                   'stability': build_stability_cases, 'tuned': build_tuned_cases}[args.comparison]
         cases = builder(x, v if args.operation == 'avey' else None, gate, bias)
         for case in cases:
             _check(case.fn(), case.expected)  # Compilation and validation outside timing.
-        if args.comparison == 'stability':
+        if args.comparison in ('stability', 'tuned'):
             for result in measure_stability(cases, warmup=args.warmup,
-                                            iterations=args.iterations, repeats=args.repeats):
+                                            iterations=args.iterations, repeats=args.repeats,
+                                            baseline='w4_s1' if args.comparison == 'tuned' else 'w4_s3'):
                 results.append(result)
                 report_path.write_text(json.dumps(report, indent=2) + '\n')
                 print(f'round={result["round"]} position={result["position"]} '
@@ -345,13 +379,13 @@ def main():
                 print(f'{case.name:40s} {result["gpu_span_us"]:9.3f} us '
                       f'range=[{result["gpu_span_min_us"]:.3f}, {result["gpu_span_max_us"]:.3f}] '
                       f'speedup={result[speedup_key]:.3f}x', flush=True)
-    if args.comparison not in ('ordering', 'stability'):
+    if args.comparison not in ('ordering', 'stability', 'tuned'):
         pytorch_us = next(r['gpu_span_us'] for r in results if '/pytorch/' in r['case'])
         print('Speedup relative to compiled PyTorch mixing:', flush=True)
         for result in results:
             result['speedup_vs_pytorch'] = pytorch_us / result['gpu_span_us']
             print(f'{result["case"]:40s} {result["speedup_vs_pytorch"]:.3f}x', flush=True)
-    if args.comparison == 'stability':
+    if args.comparison in ('stability', 'tuned'):
         report['summary'] = summarize_stability(results)
         print('Median paired speedups across six measurement orders:', flush=True)
         for row in report['summary']:

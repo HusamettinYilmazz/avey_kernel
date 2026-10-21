@@ -127,11 +127,12 @@ def _mix_kernel(
 # Keep the raw JIT kernel available for fixed launches and offline compilation.
 # Group 1 retains query-major order; groups 4/8 encourage input cache reuse.
 # This changes the mapping, not execution order or similarity recomputation.
+# One-stage variants reduce pipeline resource pressure on measured SM86 workloads.
 # All candidates overwrite Out completely; no reset hooks or input mutation.
 _AUTOTUNE_CONFIGS = [
-    triton.Config(dict(BM=bm, BN=bn, BK=32, BD=bd, GROUP_M=group), num_warps=4, num_stages=3)
+    triton.Config(dict(BM=bm, BN=bn, BK=32, BD=bd, GROUP_M=group), num_warps=4, num_stages=stages)
     for bm in (16, 32) for bn in (32, 64) for bd in (32, 64, 128)
-    for group in (1, 4, 8)
+    for group in (1, 4, 8) for stages in (3, 1)
 ] + [
     triton.Config(dict(BM=bm, BN=bn, BK=32, BD=128, GROUP_M=group), num_warps=8, num_stages=2)
     for bm in (16, 32) for bn in (32, 64) for group in (1, 4, 8)
