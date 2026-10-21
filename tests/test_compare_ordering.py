@@ -16,6 +16,59 @@ class OrderingComparisonTests(unittest.TestCase):
         result = torch_causal_mix(x, q, v, torch.ones_like(x), torch.tensor([1., 2.]))
         torch.testing.assert_close(result, torch.tensor([[[5., 2.], [57., 2.]]]))
 
+    def test_stability_balances_order_and_pairs_each_round(self):
+        from unittest.mock import patch
+        from benchmarks.compare_ordering import measure_stability
+        from benchmarks.profile_contextualizer import ProfileCase
+        labels = ('w4_s3', 'w4_s1', 'pytorch')
+        cases = [ProfileCase(f'avey/mix_only/{label}/compiled', None, None) for label in labels]
+        calls = []
+
+        def timing(case, mode, **kwargs):
+            round_number = len(calls) // 3 + 1
+            calls.append(case.name.split('/')[2])
+            base = {'w4_s3': 400., 'w4_s1': 300., 'pytorch': 200.}[calls[-1]]
+            return dict(case=case.name, gpu_span_us=round_number * base,
+                        gpu_span_min_us=round_number * base, gpu_span_max_us=round_number * base)
+
+        with patch('benchmarks.compare_ordering.measure_case', side_effect=timing) as measured:
+            rows = list(measure_stability(cases, warmup=2, iterations=3, repeats=4))
+        self.assertEqual(len(rows), 18)
+        orders = [tuple(calls[i:i+3]) for i in range(0, 18, 3)]
+        self.assertEqual(len(set(orders)), 6)
+        for label in labels:
+            for position in range(3):
+                self.assertEqual(sum(order[position] == label for order in orders), 2)
+        for row in rows:
+            label = row['case'].split('/')[2]
+            self.assertEqual(row['speedup_vs_pytorch'],
+                             {'w4_s3': .5, 'w4_s1': 2./3., 'pytorch': 1.}[label])
+            self.assertEqual(row['round'], rows.index(row) // 3 + 1)
+            self.assertEqual(row['position'], rows.index(row) % 3 + 1)
+        for call in measured.call_args_list:
+            self.assertEqual(call.args[1], 'cuda_graph')
+            self.assertEqual(call.kwargs, dict(warmup=2, iterations=3, repeats=4))
+
+    def test_stability_cases_select_only_the_two_fixed_launches_and_pytorch(self):
+        from benchmarks.compare_ordering import build_stability_cases
+        x = torch.rand(1, 3, 5)
+        cases = build_stability_cases(x, torch.ones(3, 3), x, x[0, 0],
+                                      compile_functions=False)
+        self.assertEqual([case.name for case in cases],
+                         [f'avey/mix_only/{label}/eager'
+                          for label in ('w4_s3', 'w4_s1', 'pytorch')])
+
+    def test_stability_summary_uses_median_of_paired_ratios(self):
+        from benchmarks.compare_ordering import summarize_stability
+        rows = [dict(case='candidate', gpu_span_us=time, speedup_vs_pytorch=ratio)
+                for time, ratio in ((10., 10.), (20., 1.), (100., 2.))]
+        summary, = summarize_stability(rows)
+        self.assertEqual(summary['rounds'], 3)
+        self.assertEqual(summary['median_gpu_span_us'], 20.)
+        self.assertEqual(summary['median_paired_speedup_vs_pytorch'], 2.)
+        self.assertEqual(summary['min_paired_speedup_vs_pytorch'], 1.)
+        self.assertEqual(summary['max_paired_speedup_vs_pytorch'], 10.)
+
     @unittest.skipIf(os.environ.get('TRITON_INTERPRET') == '1', 'requires JIT wrapping')
     def test_launch_sweep_keeps_math_and_grid_fixed(self):
         from benchmarks.compare_ordering import mix_fixed_order, LAUNCH_CONFIGS

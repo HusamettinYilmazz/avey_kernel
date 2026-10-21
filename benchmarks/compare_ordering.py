@@ -1,4 +1,4 @@
-"""Controlled ordering, causal-skip, or tile comparison; no timed normalization.
+"""Controlled mixing comparisons; no timed normalization.
 
 Our Triton launch configurations are fixed. The causal and tile comparisons include
 an optimized PyTorch mixing baseline, with GEMM tuning completed before timing.
@@ -6,12 +6,15 @@ an optimized PyTorch mixing baseline, with GEMM tuning completed before timing.
 Add --comparison causal to compare full key traversal against skipping future tiles.
 Add --comparison tiles to sweep BM=16/32 and BD=64/128/256 with causal skipping.
 Add --comparison launch to sweep warps=4/8 and stages=1/2/3 at BM32/BD128.
+Add --comparison stability to compare w4_s3, w4_s1, and PyTorch in all six orders.
 
 python3 -m benchmarks.compare_ordering --output-dir gpu-profile-ordering-fixed
 """
 import argparse
 import csv
 import json
+from itertools import permutations
+from statistics import median
 from pathlib import Path
 import platform
 from typing import Optional
@@ -155,13 +158,13 @@ def build_tile_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
 LAUNCH_CONFIGS = ((4, 3), (4, 1), (4, 2), (8, 1), (8, 2), (8, 3))
 
 
-def build_launch_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
+def build_launch_cases(z_tr, v, z_tl, bias, *, compile_functions=True, configs=LAUNCH_CONFIGS):
     """Fix BM32/BD128 and vary only warps and pipeline stages."""
     z_tr_norm = F.normalize(z_tr.float(), dim=-1, eps=1e-12).contiguous()
     expected = avey(z_tr, v, z_tl=z_tl, bias=bias, backend='torch')
     cases = []
     suffix = 'compiled' if compile_functions else 'eager'
-    for warps, stages in LAUNCH_CONFIGS:
+    for warps, stages in configs:
         def fn(warps=warps, stages=stages):
             return mix_fixed_order(z_tr, z_tr_norm, v, z_tl, bias,
                                    1, True, 32, 128, warps, stages)
@@ -175,9 +178,51 @@ def build_launch_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
     return cases
 
 
+STABILITY_CONFIGS = ((4, 3), (4, 1))
+
+
+def build_stability_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
+    return build_launch_cases(z_tr, v, z_tl, bias, compile_functions=compile_functions,
+                              configs=STABILITY_CONFIGS)
+
+
+def measure_stability(cases, *, warmup, iterations, repeats):
+    """Six balanced orders, with speedups paired within each round."""
+    for round_number, order in enumerate(permutations(cases), start=1):
+        rows = []
+        for position, case in enumerate(order, start=1):
+            result = measure_case(case, 'cuda_graph', warmup=warmup,
+                                  iterations=iterations, repeats=repeats)
+            label = case.name.split('/')[2]
+            result.update(round=round_number, position=position,
+                          num_warps=None if label == 'pytorch' else 4,
+                          num_stages=None if label == 'pytorch' else int(label.split('_s')[1]))
+            rows.append(result)
+        times = {r['case'].split('/')[2]: r['gpu_span_us'] for r in rows}
+        for result in rows:
+            result['speedup_vs_pytorch'] = times['pytorch'] / result['gpu_span_us']
+            result['speedup_vs_w4_s3'] = times['w4_s3'] / result['gpu_span_us']
+            yield result
+
+
+def summarize_stability(results):
+    summaries = []
+    for name in dict.fromkeys(r['case'] for r in results):
+        rows = [r for r in results if r['case'] == name]
+        summaries.append(dict(case=name, rounds=len(rows),
+                              median_gpu_span_us=median(r['gpu_span_us'] for r in rows),
+                              median_paired_speedup_vs_pytorch=median(
+                                  r['speedup_vs_pytorch'] for r in rows),
+                              min_paired_speedup_vs_pytorch=min(
+                                  r['speedup_vs_pytorch'] for r in rows),
+                              max_paired_speedup_vs_pytorch=max(
+                                  r['speedup_vs_pytorch'] for r in rows)))
+    return summaries
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--comparison', choices=('ordering', 'causal', 'tiles', 'launch'), default='ordering')
+    parser.add_argument('--comparison', choices=('ordering', 'causal', 'tiles', 'launch', 'stability'), default='ordering')
     parser.add_argument('--batch', type=int, default=8)
     parser.add_argument('--context', type=int, default=256)
     parser.add_argument('--features', type=int, default=256)
@@ -199,7 +244,8 @@ def main():
     torch.set_float32_matmul_precision('highest')
     args.output_dir.mkdir(parents=True, exist_ok=True)
     fixed_config = dict(FIXED_CONFIG)
-    varying = {'tiles': ('BM', 'BD'), 'launch': ('num_warps', 'num_stages')}
+    varying = {'tiles': ('BM', 'BD'), 'launch': ('num_warps', 'num_stages'),
+               'stability': ('num_stages',)}
     for key in varying.get(args.comparison, ()):
         del fixed_config[key]
     metadata = dict(python=platform.python_version(), torch=torch.__version__,
@@ -208,7 +254,9 @@ def main():
                     shape=[args.batch, args.context, args.features], dtype=args.dtype,
                     seed=42, fixed_config=fixed_config,
                     tile_configs=list(TILE_CONFIGS) if args.comparison == 'tiles' else None,
-                    launch_configs=list(LAUNCH_CONFIGS) if args.comparison == 'launch' else None,
+                    launch_configs=(list(LAUNCH_CONFIGS) if args.comparison == 'launch' else
+                                    list(STABILITY_CONFIGS) if args.comparison == 'stability' else None),
+                    rounds=6 if args.comparison == 'stability' else 1,
                     comparison=args.comparison,
                     group_sizes=[1, 4, 8] if args.comparison == 'ordering' else [1],
                     skip_causal_options=[False, True] if args.comparison == 'causal' else [True],
@@ -226,50 +274,69 @@ def main():
         v = torch.randn(args.context, args.context, device='cuda', dtype=x.dtype)
         gate, bias = torch.rand_like(x), torch.rand(args.features, device='cuda', dtype=x.dtype)
         builder = {'ordering': build_ordering_cases, 'causal': build_causal_cases,
-                   'tiles': build_tile_cases, 'launch': build_launch_cases}[args.comparison]
+                   'tiles': build_tile_cases, 'launch': build_launch_cases,
+                   'stability': build_stability_cases}[args.comparison]
         cases = builder(x, v, gate, bias)
         for case in cases:
             _check(case.fn(), case.expected)  # Compilation and validation outside timing.
-        baselines = {}
-        for case in cases:
-            result = measure_case(case, 'cuda_graph', warmup=args.warmup,
-                                  iterations=args.iterations, repeats=args.repeats)
-            architecture, _, group, _ = case.name.split('/')
-            if group in ('group1', 'full_keys', 'bm32_bd128', 'w4_s3'):
-                baselines[architecture] = result['gpu_span_us']
-            if args.comparison == 'ordering':
-                result['group_m'] = int(group.removeprefix('group'))
-                speedup_key = 'speedup_vs_group1'
-            elif args.comparison == 'launch':
-                result['group_m'] = None if group == 'pytorch' else 1
-                result['skip_causal'] = None if group == 'pytorch' else True
-                warps, stages = (None, None) if group == 'pytorch' else map(
-                    int, group.removeprefix('w').split('_s'))
-                result['num_warps'], result['num_stages'] = warps, stages
-                speedup_key = 'speedup_vs_w4_s3'
-            elif args.comparison == 'tiles':
-                result['group_m'] = None if group == 'pytorch' else 1
-                result['skip_causal'] = None if group == 'pytorch' else True
-                bm, bd = (None, None) if group == 'pytorch' else map(
-                    int, group.removeprefix('bm').split('_bd'))
-                result['bm'], result['bd'] = bm, bd
-                speedup_key = 'speedup_vs_bm32_bd128'
-            else:
-                result['group_m'] = None if group == 'pytorch' else 1
-                result['skip_causal'] = None if group == 'pytorch' else group == 'skip_future'
-                speedup_key = 'speedup_vs_full_keys'
-            result[speedup_key] = baselines[architecture] / result['gpu_span_us']
-            results.append(result)
-            report_path.write_text(json.dumps(report, indent=2) + '\n')
-            print(f'{case.name:40s} {result["gpu_span_us"]:9.3f} us '
-                  f'range=[{result["gpu_span_min_us"]:.3f}, {result["gpu_span_max_us"]:.3f}] '
-                  f'speedup={result[speedup_key]:.3f}x', flush=True)
-    if args.comparison != 'ordering':
+        if args.comparison == 'stability':
+            for result in measure_stability(cases, warmup=args.warmup,
+                                            iterations=args.iterations, repeats=args.repeats):
+                results.append(result)
+                report_path.write_text(json.dumps(report, indent=2) + '\n')
+                print(f'round={result["round"]} position={result["position"]} '
+                      f'{result["case"]:36s} {result["gpu_span_us"]:9.3f} us '
+                      f'range=[{result["gpu_span_min_us"]:.3f}, {result["gpu_span_max_us"]:.3f}] '
+                      f'vs_pytorch={result["speedup_vs_pytorch"]:.3f}x', flush=True)
+        else:
+            baselines = {}
+            for case in cases:
+                result = measure_case(case, 'cuda_graph', warmup=args.warmup,
+                                      iterations=args.iterations, repeats=args.repeats)
+                architecture, _, group, _ = case.name.split('/')
+                if group in ('group1', 'full_keys', 'bm32_bd128', 'w4_s3'):
+                    baselines[architecture] = result['gpu_span_us']
+                if args.comparison == 'ordering':
+                    result['group_m'] = int(group.removeprefix('group'))
+                    speedup_key = 'speedup_vs_group1'
+                elif args.comparison == 'launch':
+                    result['group_m'] = None if group == 'pytorch' else 1
+                    result['skip_causal'] = None if group == 'pytorch' else True
+                    warps, stages = (None, None) if group == 'pytorch' else map(
+                        int, group.removeprefix('w').split('_s'))
+                    result['num_warps'], result['num_stages'] = warps, stages
+                    speedup_key = 'speedup_vs_w4_s3'
+                elif args.comparison == 'tiles':
+                    result['group_m'] = None if group == 'pytorch' else 1
+                    result['skip_causal'] = None if group == 'pytorch' else True
+                    bm, bd = (None, None) if group == 'pytorch' else map(
+                        int, group.removeprefix('bm').split('_bd'))
+                    result['bm'], result['bd'] = bm, bd
+                    speedup_key = 'speedup_vs_bm32_bd128'
+                else:
+                    result['group_m'] = None if group == 'pytorch' else 1
+                    result['skip_causal'] = None if group == 'pytorch' else group == 'skip_future'
+                    speedup_key = 'speedup_vs_full_keys'
+                result[speedup_key] = baselines[architecture] / result['gpu_span_us']
+                results.append(result)
+                report_path.write_text(json.dumps(report, indent=2) + '\n')
+                print(f'{case.name:40s} {result["gpu_span_us"]:9.3f} us '
+                      f'range=[{result["gpu_span_min_us"]:.3f}, {result["gpu_span_max_us"]:.3f}] '
+                      f'speedup={result[speedup_key]:.3f}x', flush=True)
+    if args.comparison not in ('ordering', 'stability'):
         pytorch_us = next(r['gpu_span_us'] for r in results if '/pytorch/' in r['case'])
         print('Speedup relative to compiled PyTorch mixing:', flush=True)
         for result in results:
             result['speedup_vs_pytorch'] = pytorch_us / result['gpu_span_us']
             print(f'{result["case"]:40s} {result["speedup_vs_pytorch"]:.3f}x', flush=True)
+    if args.comparison == 'stability':
+        report['summary'] = summarize_stability(results)
+        print('Median paired speedups across six measurement orders:', flush=True)
+        for row in report['summary']:
+            print(f'{row["case"]:40s} {row["median_gpu_span_us"]:.3f} us '
+                  f'vs_pytorch={row["median_paired_speedup_vs_pytorch"]:.3f}x '
+                  f'range=[{row["min_paired_speedup_vs_pytorch"]:.3f}, '
+                  f'{row["max_paired_speedup_vs_pytorch"]:.3f}]', flush=True)
     report['complete'] = True
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     with (args.output_dir / 'timings.csv').open('w', newline='') as file:
