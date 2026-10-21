@@ -1,9 +1,10 @@
-"""Controlled ordering or causal-skip comparison; no timed normalization.
+"""Controlled ordering, causal-skip, or tile comparison; no timed normalization.
 
-Our Triton launch configurations are fixed. The causal comparison also includes
+Our Triton launch configurations are fixed. The causal and tile comparisons include
 an optimized PyTorch mixing baseline, with GEMM tuning completed before timing.
 
 Add --comparison causal to compare full key traversal against skipping future tiles.
+Add --comparison tiles to sweep BM=16/32 and BD=64/128/256 with causal skipping.
 
 python3 -m benchmarks.compare_ordering --output-dir gpu-profile-ordering-fixed
 """
@@ -30,22 +31,30 @@ FIXED_CONFIG = dict(BM=32, BN=64, BK=32, BD=128, num_warps=4, num_stages=3)
 @triton_op('avey_bench::mix_fixed_order', mutates_args={})
 def mix_fixed_order(z_tr: torch.Tensor, z_tr_norm: torch.Tensor,
                     v: Optional[torch.Tensor], z_tl: torch.Tensor,
-                    bias: torch.Tensor, group_m: int, skip_causal: bool = True) -> torch.Tensor:
+                    bias: torch.Tensor, group_m: int, skip_causal: bool = True,
+                    bm: int = 32, bd: int = 128) -> torch.Tensor:
     # Specialize a changing backed SymInt rather than forwarding it as a
     # runtime argument to a constexpr parameter.
     if isinstance(group_m, torch.SymInt):
         group_m = int(group_m)
     if type(group_m) is not int or group_m not in (1, 4, 8):
         raise ValueError('group_m must be 1, 4, or 8')
+    bm = int(bm) if isinstance(bm, torch.SymInt) else bm
+    bd = int(bd) if isinstance(bd, torch.SymInt) else bd
+    if type(bm) is not int or bm not in (16, 32):
+        raise ValueError('bm must be 16 or 32')
+    if type(bd) is not int or bd not in (64, 128, 256):
+        raise ValueError('bd must be 64, 128, or 256')
+    config = {**FIXED_CONFIG, 'BM': bm, 'BD': bd}
     batch, c, d_prime = z_tr.shape
     out = torch.empty_like(z_tr)
-    wrap_triton(_mix_kernel)[(triton.cdiv(c, 32) * triton.cdiv(d_prime, 128), batch)](
+    wrap_triton(_mix_kernel)[(triton.cdiv(c, bm) * triton.cdiv(d_prime, bd), batch)](
         z_tr, z_tr_norm, v if v is not None else z_tr, z_tl, bias, z_tr, out,
         C=c, D_PRIME=d_prime, EPS=1e-6, HAS_V=v is not None,
         HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=False,
         CAUSAL=v is not None, NORMALIZE=v is None, ACT=0,
         BATCH=batch, DEVICE=z_tr.device.index if z_tr.device.index is not None else -1,
-        GROUP_M=group_m, SKIP_CAUSAL=skip_causal, **FIXED_CONFIG)
+        GROUP_M=group_m, SKIP_CAUSAL=skip_causal, **config)
     return out
 
 
@@ -94,6 +103,11 @@ def build_causal_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
                 'triton.cudagraphs': False,
             })
         cases.append(ProfileCase(f'avey/mix_only/{label}/{suffix}', fn, expected, 128))
+    cases.append(_pytorch_case(z_tr, z_tr_norm, v, z_tl, bias, expected, compile_functions))
+    return cases
+
+
+def _pytorch_case(z_tr, z_tr_norm, v, z_tl, bias, expected, compile_functions):
     def reference():
         return torch_causal_mix(z_tr, z_tr_norm, v, z_tl, bias)
 
@@ -102,13 +116,36 @@ def build_causal_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
             'max_autotune': True, 'coordinate_descent_tuning': True,
             'triton.cudagraphs': False,
         })
-    cases.append(ProfileCase(f'avey/mix_only/pytorch/{suffix}', reference, expected))
+    suffix = 'compiled' if compile_functions else 'eager'
+    return ProfileCase(f'avey/mix_only/pytorch/{suffix}', reference, expected)
+
+
+# Put the previous configuration first so each result has a measured baseline.
+TILE_CONFIGS = ((32, 128), (16, 64), (16, 128), (16, 256), (32, 64), (32, 256))
+
+
+def build_tile_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
+    """Vary accumulator dimensions while fixing ordering and causal skipping."""
+    z_tr_norm = F.normalize(z_tr.float(), dim=-1, eps=1e-12).contiguous()
+    expected = avey(z_tr, v, z_tl=z_tl, bias=bias, backend='torch')
+    cases = []
+    suffix = 'compiled' if compile_functions else 'eager'
+    for bm, bd in TILE_CONFIGS:
+        def fn(bm=bm, bd=bd):
+            return mix_fixed_order(z_tr, z_tr_norm, v, z_tl, bias, 1, True, bm, bd)
+        if compile_functions:
+            fn = torch.compile(fn, fullgraph=True, options={
+                'max_autotune': False, 'coordinate_descent_tuning': False,
+                'triton.cudagraphs': False,
+            })
+        cases.append(ProfileCase(f'avey/mix_only/bm{bm}_bd{bd}/{suffix}', fn, expected, bd))
+    cases.append(_pytorch_case(z_tr, z_tr_norm, v, z_tl, bias, expected, compile_functions))
     return cases
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--comparison', choices=('ordering', 'causal'), default='ordering')
+    parser.add_argument('--comparison', choices=('ordering', 'causal', 'tiles'), default='ordering')
     parser.add_argument('--batch', type=int, default=8)
     parser.add_argument('--context', type=int, default=256)
     parser.add_argument('--features', type=int, default=256)
@@ -133,10 +170,14 @@ def main():
                     triton=triton.__version__, cuda=torch.version.cuda,
                     gpu=torch.cuda.get_device_name(), capability=torch.cuda.get_device_capability(),
                     shape=[args.batch, args.context, args.features], dtype=args.dtype,
-                    seed=42, fixed_config=FIXED_CONFIG, comparison=args.comparison,
+                    seed=42, fixed_config=({k: v for k, v in FIXED_CONFIG.items()
+                                           if k not in ('BM', 'BD')}
+                                          if args.comparison == 'tiles' else FIXED_CONFIG),
+                    tile_configs=list(TILE_CONFIGS) if args.comparison == 'tiles' else None,
+                    comparison=args.comparison,
                     group_sizes=[1, 4, 8] if args.comparison == 'ordering' else [1],
-                    skip_causal_options=[True] if args.comparison == 'ordering' else [False, True],
-                    autotune=False, pytorch_max_autotune=args.comparison == 'causal',
+                    skip_causal_options=[False, True] if args.comparison == 'causal' else [True],
+                    autotune=False, pytorch_max_autotune=args.comparison != 'ordering',
                     normalization_timed=False, mode='cuda_graph',
                     warmup=args.warmup, iterations=args.iterations, repeats=args.repeats,
                     matmul_precision='highest')
@@ -149,7 +190,8 @@ def main():
         x = torch.rand(*metadata['shape'], device='cuda', dtype=getattr(torch, args.dtype))
         v = torch.randn(args.context, args.context, device='cuda', dtype=x.dtype)
         gate, bias = torch.rand_like(x), torch.rand(args.features, device='cuda', dtype=x.dtype)
-        builder = build_ordering_cases if args.comparison == 'ordering' else build_causal_cases
+        builder = {'ordering': build_ordering_cases, 'causal': build_causal_cases,
+                   'tiles': build_tile_cases}[args.comparison]
         cases = builder(x, v, gate, bias)
         for case in cases:
             _check(case.fn(), case.expected)  # Compilation and validation outside timing.
@@ -158,11 +200,18 @@ def main():
             result = measure_case(case, 'cuda_graph', warmup=args.warmup,
                                   iterations=args.iterations, repeats=args.repeats)
             architecture, _, group, _ = case.name.split('/')
-            if group in ('group1', 'full_keys'):
+            if group in ('group1', 'full_keys', 'bm32_bd128'):
                 baselines[architecture] = result['gpu_span_us']
             if args.comparison == 'ordering':
                 result['group_m'] = int(group.removeprefix('group'))
                 speedup_key = 'speedup_vs_group1'
+            elif args.comparison == 'tiles':
+                result['group_m'] = None if group == 'pytorch' else 1
+                result['skip_causal'] = None if group == 'pytorch' else True
+                bm, bd = (None, None) if group == 'pytorch' else map(
+                    int, group.removeprefix('bm').split('_bd'))
+                result['bm'], result['bd'] = bm, bd
+                speedup_key = 'speedup_vs_bm32_bd128'
             else:
                 result['group_m'] = None if group == 'pytorch' else 1
                 result['skip_causal'] = None if group == 'pytorch' else group == 'skip_future'
@@ -173,7 +222,7 @@ def main():
             print(f'{case.name:40s} {result["gpu_span_us"]:9.3f} us '
                   f'range=[{result["gpu_span_min_us"]:.3f}, {result["gpu_span_max_us"]:.3f}] '
                   f'speedup={result[speedup_key]:.3f}x', flush=True)
-    if args.comparison == 'causal':
+    if args.comparison != 'ordering':
         pytorch_us = next(r['gpu_span_us'] for r in results if '/pytorch/' in r['case'])
         print('Speedup relative to compiled PyTorch mixing:', flush=True)
         for result in results:
