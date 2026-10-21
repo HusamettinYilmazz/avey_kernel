@@ -36,6 +36,17 @@ def _tile_ids(pid, n_query_tiles, n_feature_tiles, GROUP_M: tl.constexpr):
 
 
 @triton.jit
+def _key_tile_count(query_tile, C: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                    CAUSAL: tl.constexpr, SKIP_CAUSAL: tl.constexpr):
+    if CAUSAL and SKIP_CAUSAL:
+        # Retain the diagonal-crossing key tile; its elementwise mask still
+        # enforces causality. Clamp the last partial query block to C.
+        query_end = tl.minimum((query_tile + 1) * BM, C)
+        return tl.cdiv(query_end, BN)
+    return tl.cdiv(C, BN)
+
+
+@triton.jit
 def _mix_kernel(
     Z_TR, Z_TR_NORM, V, Z_TL, Bias, Valid, Out,
     C: tl.constexpr, D_PRIME: tl.constexpr, EPS: tl.constexpr,
@@ -44,6 +55,7 @@ def _mix_kernel(
     CAUSAL: tl.constexpr, NORMALIZE: tl.constexpr, ACT: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, BD: tl.constexpr,
     BATCH: tl.constexpr = 1, DEVICE: tl.constexpr = -1, GROUP_M: tl.constexpr = 1,
+    SKIP_CAUSAL: tl.constexpr = True,
 ):
     batch = tl.program_id(1)
     n_feature_tiles = tl.cdiv(D_PRIME, BD)
@@ -58,7 +70,8 @@ def _mix_kernel(
         row_valid = row_valid & (tl.load(Valid + batch * C + rows, rows < C, other=0) != 0)
     accumulator = tl.full((BM, BD), 0, tl.float32)
     denominator = tl.full((BM,), 0, tl.float32)
-    for key_start in range(tl.cdiv(C, BN)):
+    n_key_tiles = _key_tile_count(query_tile, C, BM, BN, CAUSAL, SKIP_CAUSAL)
+    for key_start in range(n_key_tiles):
         keys = key_start * BN + tl.arange(0, BN)
         key_valid = keys < C
         if HAS_VALID:
@@ -128,7 +141,7 @@ _mix_autotuned = triton.autotune(
     # Triton also appends tensor dtypes to its in-memory key. DEVICE separates
     # devices in a multi-GPU process; BATCH matters for launch occupancy.
     key=['BATCH', 'DEVICE', 'C', 'D_PRIME', 'EPS', 'HAS_V', 'HAS_Z_TL',
-         'HAS_BIAS', 'HAS_VALID', 'CAUSAL', 'NORMALIZE', 'ACT'],
+         'HAS_BIAS', 'HAS_VALID', 'CAUSAL', 'NORMALIZE', 'ACT', 'SKIP_CAUSAL'],
 )(_mix_kernel)
 
 
@@ -159,11 +172,12 @@ def mix(
         def grid(meta):
             return (triton.cdiv(c, meta['BM']) * triton.cdiv(d_prime, meta['BD']), batch)
         wrap_triton(_mix_autotuned)[grid](
-            *args, BATCH=batch, DEVICE=z_tr.device.index if z_tr.device.index is not None else -1)
+            *args, BATCH=batch, DEVICE=z_tr.device.index if z_tr.device.index is not None else -1,
+            SKIP_CAUSAL=True)
     else:
         wrap_triton(_mix_kernel)[(triton.cdiv(c, 16) * triton.cdiv(d_prime, output_tile), batch)](
             # Inductor's argument analysis does not fill in JIT defaults.
             *args, 16, 32, 32, output_tile, BATCH=batch,
             DEVICE=z_tr.device.index if z_tr.device.index is not None else -1,
-            GROUP_M=1, num_warps=4)
+            GROUP_M=1, SKIP_CAUSAL=True, num_warps=4)
     return out

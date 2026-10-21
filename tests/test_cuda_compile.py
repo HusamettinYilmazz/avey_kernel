@@ -7,6 +7,27 @@ import unittest
 @unittest.skipUnless(os.environ.get('AVEY_TEST_CUDA_COMPILE') == '1',
                      'set AVEY_TEST_CUDA_COMPILE=1 for offline CUDA compilation')
 class OfflineCudaCompilationTests(unittest.TestCase):
+    def test_causal_skip_toggle_generates_sm86_cubin(self):
+        import triton
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler.compiler import ASTSource
+        from avey_kernels._triton import _mix_kernel
+        for dtype in ('fp32', 'fp16', 'bf16'):
+            for skip in (False, True):
+                with self.subTest(dtype=dtype, skip=skip):
+                    signature = {name: '*' + dtype for name in
+                                 ('Z_TR', 'V', 'Z_TL', 'Bias', 'Out')}
+                    signature.update(Z_TR_NORM='*fp32', Valid='*i1')
+                    constants = dict(C=256, D_PRIME=256, EPS=1e-6, HAS_V=True,
+                                     HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=False,
+                                     CAUSAL=True, NORMALIZE=False, ACT=0,
+                                     BM=32, BN=64, BK=32, BD=128, BATCH=8, DEVICE=0,
+                                     GROUP_M=1, SKIP_CAUSAL=skip)
+                    kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
+                                            target=GPUTarget('cuda', 86, 32),
+                                            options={'num_warps': 4, 'num_stages': 3})
+                    self.assertTrue(kernel.asm['cubin'])
+
     def test_byte_backed_validity_mask_compiles_for_access_analysis(self):
         import triton
         from triton.backends.compiler import GPUTarget
@@ -23,7 +44,7 @@ class OfflineCudaCompilationTests(unittest.TestCase):
                 constants = dict(C=35, D_PRIME=37, EPS=1e-6, HAS_V=weighted,
                                  HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=True,
                                  CAUSAL=weighted, NORMALIZE=not weighted, ACT=3,
-                                 BM=16, BN=32, BK=32, BD=32, BATCH=2, DEVICE=0, GROUP_M=1)
+                                 BM=16, BN=32, BK=32, BD=32, BATCH=2, DEVICE=0, GROUP_M=1, SKIP_CAUSAL=True)
                 kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
                                         target=GPUTarget('cuda', 86, 32),
                                         options={'num_warps': 4})
@@ -42,7 +63,7 @@ class OfflineCudaCompilationTests(unittest.TestCase):
                     constants = dict(C=35, D_PRIME=133, EPS=1e-6, HAS_V=weighted,
                                      HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=True,
                                      CAUSAL=weighted, NORMALIZE=not weighted, ACT=4,
-                                     BATCH=2, DEVICE=0, **config.kwargs)
+                                     BATCH=2, DEVICE=0, SKIP_CAUSAL=True, **config.kwargs)
                     kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
                                             target=GPUTarget('cuda', 86, 32),
                                             options={'num_warps': config.num_warps,
@@ -66,7 +87,7 @@ class OfflineCudaCompilationTests(unittest.TestCase):
                                          HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=False,
                                          CAUSAL=weighted, NORMALIZE=not weighted,
                                          ACT=0, BM=16, BN=32, BK=32, BD=output_tile,
-                                         BATCH=1, DEVICE=-1, GROUP_M=1)
+                                         BATCH=1, DEVICE=-1, GROUP_M=1, SKIP_CAUSAL=True)
                         kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
                                                 target=GPUTarget('cuda', 86, 32),
                                                 options={'num_warps': 4})
@@ -89,7 +110,7 @@ class OfflineCudaCompilationTests(unittest.TestCase):
                                      HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=True,
                                      CAUSAL=weighted, NORMALIZE=not weighted,
                                      ACT=4, BM=16, BN=32, BK=32, BD=32,
-                                     BATCH=1, DEVICE=-1, GROUP_M=1)
+                                     BATCH=1, DEVICE=-1, GROUP_M=1, SKIP_CAUSAL=True)
                     kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
                                             target=GPUTarget('cuda', 80, 32),
                                             options={'num_warps': 4})
