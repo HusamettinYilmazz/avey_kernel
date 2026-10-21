@@ -38,6 +38,10 @@ def _tile_ids(pid, n_query_tiles, n_feature_tiles, GROUP_M: tl.constexpr):
 @triton.jit
 def _key_tile_count(query_tile, C: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                     CAUSAL: tl.constexpr, SKIP_CAUSAL: tl.constexpr):
+    # All nonempty query tiles use the sole key tile. Keep this bound static:
+    # a runtime one-trip loop can trigger excessive pipeline shared memory.
+    if C <= BN:
+        return 1
     if CAUSAL and SKIP_CAUSAL:
         # Retain the diagonal-crossing key tile; its elementwise mask still
         # enforces causality. Clamp the last partial query block to C.

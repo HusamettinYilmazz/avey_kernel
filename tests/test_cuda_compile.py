@@ -142,6 +142,31 @@ class OfflineCudaCompilationTests(unittest.TestCase):
                     self.assertTrue(kernel.asm['cubin'])
                     self.assertLessEqual(kernel.metadata.shared, 101376)
 
+    def test_single_key_tile_causal_specialization_fits_sm86_shared_memory(self):
+        import triton
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler.compiler import ASTSource
+        from avey_kernels._triton import _mix_kernel
+
+        # Match the tiny, padded SiLU case that exceeded RTX 3090 shared
+        # memory when causal skipping left a runtime-dependent one-trip loop.
+        signature = {name: '*fp32' for name in
+                     ('Z_TR', 'Z_TR_NORM', 'V', 'Z_TL', 'Bias', 'Out')}
+        signature['Valid'] = '*i1'
+        for group in (1, 4, 8):
+            for skip in (False, True):
+                with self.subTest(group=group, skip=skip):
+                    constants = dict(C=1, D_PRIME=7, EPS=1e-6, HAS_V=True,
+                                     HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=True,
+                                     CAUSAL=True, NORMALIZE=False, ACT=3,
+                                     BM=32, BN=64, BK=32, BD=128, BATCH=2,
+                                     DEVICE=0, GROUP_M=group, SKIP_CAUSAL=skip)
+                    kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
+                                            target=GPUTarget('cuda', 86, 32),
+                                            options={'num_warps': 4, 'num_stages': 3})
+                    self.assertTrue(kernel.asm['cubin'])
+                    self.assertLessEqual(kernel.metadata.shared, 101376)
+
     def test_sm80_specializations_generate_cubin(self):
         import triton
         from triton.backends.compiler import GPUTarget

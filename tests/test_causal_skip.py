@@ -49,7 +49,8 @@ class CausalSkippingTests(unittest.TestCase):
     @unittest.skipUnless(CAN_RUN, 'requires interpreter or NVIDIA SM80+')
     def test_future_only_tiles_are_not_visited(self):
         device = 'cpu' if os.environ.get('TRITON_INTERPRET') == '1' else 'cuda'
-        for c, bm, bn, expected in ((256, 32, 64, [1, 1, 2, 2, 3, 3, 4, 4]),
+        for c, bm, bn, expected in ((1, 32, 64, [1]), (35, 16, 64, [1, 1, 1]),
+                                    (256, 32, 64, [1, 1, 2, 2, 3, 3, 4, 4]),
                                     (65, 64, 32, [2, 3]), (35, 16, 32, [1, 1, 2])):
             for causal, skip in ((True, True), (True, False), (False, True)):
                 out = torch.empty(len(expected), dtype=torch.int32, device=device)
