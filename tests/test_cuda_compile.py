@@ -119,6 +119,29 @@ class OfflineCudaCompilationTests(unittest.TestCase):
                     self.assertTrue(kernel.asm['cubin'])
                     self.assertLessEqual(kernel.metadata.shared, 101376)
 
+    def test_avey_b_stage_comparison_generates_sm86_cubin(self):
+        import triton
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler.compiler import ASTSource
+        from avey_kernels._triton import _mix_kernel
+
+        for stages in (1, 3):
+            for dtype in ('fp32', 'fp16', 'bf16'):
+                with self.subTest(stages=stages, dtype=dtype):
+                    signature = {name: '*' + dtype for name in
+                                 ('Z_TR', 'V', 'Z_TL', 'Bias', 'Out')}
+                    signature.update(Z_TR_NORM='*fp32', Valid='*i1')
+                    constants = dict(C=256, D_PRIME=256, EPS=1e-6, HAS_V=False,
+                                     HAS_Z_TL=True, HAS_BIAS=True, HAS_VALID=False,
+                                     CAUSAL=False, NORMALIZE=True, ACT=0,
+                                     BM=32, BN=64, BK=32, BD=128, BATCH=32,
+                                     DEVICE=0, GROUP_M=1, SKIP_CAUSAL=True)
+                    kernel = triton.compile(ASTSource(_mix_kernel, signature, constants),
+                                            target=GPUTarget('cuda', 86, 32),
+                                            options={'num_warps': 4, 'num_stages': stages})
+                    self.assertTrue(kernel.asm['cubin'])
+                    self.assertLessEqual(kernel.metadata.shared, 101376)
+
     def test_sm80_specializations_generate_cubin(self):
         import triton
         from triton.backends.compiler import GPUTarget

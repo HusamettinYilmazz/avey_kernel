@@ -7,6 +7,7 @@ Add --comparison causal to compare full key traversal against skipping future ti
 Add --comparison tiles to sweep BM=16/32 and BD=64/128/256 with causal skipping.
 Add --comparison launch to sweep warps=4/8 and stages=1/2/3 at BM32/BD128.
 Add --comparison stability to compare w4_s3, w4_s1, and PyTorch in all six orders.
+Launch and stability comparisons accept --operation avey_b for dynamic Avey-B mixing.
 
 python3 -m benchmarks.compare_ordering --output-dir gpu-profile-ordering-fixed
 """
@@ -100,6 +101,14 @@ def torch_causal_mix(z_tr, z_tr_norm, v, z_tl, bias):
     return output.to(z_tr.dtype)
 
 
+def torch_dynamic_mix(z_tr, z_tr_norm, z_tl, bias):
+    """Avey-B dynamic mixing from supplied Q, with signed FP32 row sums."""
+    scores = z_tr_norm @ z_tr_norm.transpose(-1, -2)
+    numerator = scores @ z_tr.float()
+    mixed = numerator / (scores.sum(dim=-1, keepdim=True) + 1e-6)
+    return ((mixed + bias.float()) * z_tl.float()).to(z_tr.dtype)
+
+
 def build_causal_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
     """Compare fixed full/shortened key loops and an optimized PyTorch mixing baseline."""
     z_tr_norm = F.normalize(z_tr.float(), dim=-1, eps=1e-12).contiguous()
@@ -121,6 +130,8 @@ def build_causal_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
 
 def _pytorch_case(z_tr, z_tr_norm, v, z_tl, bias, expected, compile_functions):
     def reference():
+        if v is None:
+            return torch_dynamic_mix(z_tr, z_tr_norm, z_tl, bias)
         return torch_causal_mix(z_tr, z_tr_norm, v, z_tl, bias)
 
     if compile_functions:
@@ -129,7 +140,8 @@ def _pytorch_case(z_tr, z_tr_norm, v, z_tl, bias, expected, compile_functions):
             'triton.cudagraphs': False,
         })
     suffix = 'compiled' if compile_functions else 'eager'
-    return ProfileCase(f'avey/mix_only/pytorch/{suffix}', reference, expected)
+    name = 'avey' if v is not None else 'avey_b'
+    return ProfileCase(f'{name}/mix_only/pytorch/{suffix}', reference, expected)
 
 
 # Put the previous configuration first so each result has a measured baseline.
@@ -161,7 +173,9 @@ LAUNCH_CONFIGS = ((4, 3), (4, 1), (4, 2), (8, 1), (8, 2), (8, 3))
 def build_launch_cases(z_tr, v, z_tl, bias, *, compile_functions=True, configs=LAUNCH_CONFIGS):
     """Fix BM32/BD128 and vary only warps and pipeline stages."""
     z_tr_norm = F.normalize(z_tr.float(), dim=-1, eps=1e-12).contiguous()
-    expected = avey(z_tr, v, z_tl=z_tl, bias=bias, backend='torch')
+    name = 'avey' if v is not None else 'avey_b'
+    expected = (avey(z_tr, v, z_tl=z_tl, bias=bias, backend='torch') if v is not None
+                else avey_b(z_tr, z_tl=z_tl, bias=bias, backend='torch'))
     cases = []
     suffix = 'compiled' if compile_functions else 'eager'
     for warps, stages in configs:
@@ -173,7 +187,7 @@ def build_launch_cases(z_tr, v, z_tl, bias, *, compile_functions=True, configs=L
                 'max_autotune': False, 'coordinate_descent_tuning': False,
                 'triton.cudagraphs': False,
             })
-        cases.append(ProfileCase(f'avey/mix_only/w{warps}_s{stages}/{suffix}', fn, expected, 128))
+        cases.append(ProfileCase(f'{name}/mix_only/w{warps}_s{stages}/{suffix}', fn, expected, 128))
     cases.append(_pytorch_case(z_tr, z_tr_norm, v, z_tl, bias, expected, compile_functions))
     return cases
 
@@ -223,6 +237,7 @@ def summarize_stability(results):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--comparison', choices=('ordering', 'causal', 'tiles', 'launch', 'stability'), default='ordering')
+    parser.add_argument('--operation', choices=('avey', 'avey_b'), default='avey')
     parser.add_argument('--batch', type=int, default=8)
     parser.add_argument('--context', type=int, default=256)
     parser.add_argument('--features', type=int, default=256)
@@ -232,6 +247,8 @@ def main():
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--output-dir', type=Path, default=None)
     args = parser.parse_args()
+    if args.operation == 'avey_b' and args.comparison not in ('launch', 'stability'):
+        parser.error('--operation avey_b supports --comparison launch or stability')
     if min(args.batch, args.context, args.features, args.warmup,
            args.iterations, args.repeats) < 1:
         parser.error('dimensions and iteration counts must be positive')
@@ -239,7 +256,8 @@ def main():
             or torch.cuda.get_device_capability()[0] < 8):
         parser.error('a working NVIDIA SM80+ GPU is required')
     if args.output_dir is None:
-        args.output_dir = Path(f'gpu-profile-{args.comparison}-fixed')
+        suffix = '-avey-b' if args.operation == 'avey_b' else ''
+        args.output_dir = Path(f'gpu-profile-{args.comparison}-fixed{suffix}')
     torch.manual_seed(42)
     torch.set_float32_matmul_precision('highest')
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -258,6 +276,10 @@ def main():
                                     list(STABILITY_CONFIGS) if args.comparison == 'stability' else None),
                     rounds=6 if args.comparison == 'stability' else 1,
                     comparison=args.comparison,
+                    operation='both' if args.comparison == 'ordering' else args.operation,
+                    causal=None if args.comparison == 'ordering' else args.operation == 'avey',
+                    signed_row_normalization=(None if args.comparison == 'ordering'
+                                              else args.operation == 'avey_b'),
                     group_sizes=[1, 4, 8] if args.comparison == 'ordering' else [1],
                     skip_causal_options=[False, True] if args.comparison == 'causal' else [True],
                     autotune=False, pytorch_max_autotune=args.comparison != 'ordering',
@@ -276,7 +298,7 @@ def main():
         builder = {'ordering': build_ordering_cases, 'causal': build_causal_cases,
                    'tiles': build_tile_cases, 'launch': build_launch_cases,
                    'stability': build_stability_cases}[args.comparison]
-        cases = builder(x, v, gate, bias)
+        cases = builder(x, v if args.operation == 'avey' else None, gate, bias)
         for case in cases:
             _check(case.fn(), case.expected)  # Compilation and validation outside timing.
         if args.comparison == 'stability':

@@ -16,6 +16,41 @@ class OrderingComparisonTests(unittest.TestCase):
         result = torch_causal_mix(x, q, v, torch.ones_like(x), torch.tensor([1., 2.]))
         torch.testing.assert_close(result, torch.tensor([[[5., 2.], [57., 2.]]]))
 
+    def test_avey_b_baseline_uses_supplied_q_and_signed_row_sum(self):
+        from benchmarks.compare_ordering import torch_dynamic_mix
+        x = torch.tensor([[[1., 0.], [3., 0.]]])
+        q = torch.tensor([[[2., 0.], [-4., 0.]]])
+        gate = torch.tensor([[[2., 3.], [4., 5.]]])
+        bias = torch.tensor([1., 2.])
+        expected = torch.tensor([[[(-20. / (-4. + 1e-6) + 1.) * 2., 6.],
+                                  [(40. / (8. + 1e-6) + 1.) * 4., 10.]]])
+        torch.testing.assert_close(torch_dynamic_mix(x, q, gate, bias), expected)
+
+    def test_avey_b_stability_uses_matching_reference_and_labels(self):
+        from benchmarks.compare_ordering import build_stability_cases
+        x = torch.rand(1, 3, 5)
+        cases = build_stability_cases(x, None, x, x[0, 0], compile_functions=False)
+        self.assertEqual([c.name for c in cases],
+                         [f'avey_b/mix_only/{label}/eager'
+                          for label in ('w4_s3', 'w4_s1', 'pytorch')])
+        torch.testing.assert_close(cases[-1].fn(), cases[-1].expected)
+
+    @unittest.skipUnless(os.environ.get('TRITON_INTERPRET') == '1'
+                         or (torch.cuda.is_available() and torch.version.hip is None
+                             and torch.cuda.get_device_capability()[0] >= 8),
+                         'requires interpreter or NVIDIA SM80+')
+    def test_avey_b_stability_matches_reference_across_tails(self):
+        from benchmarks.compare_ordering import build_stability_cases
+        device = 'cpu' if os.environ.get('TRITON_INTERPRET') == '1' else 'cuda'
+        torch.manual_seed(46)
+        for c, d in ((35, 133), (67, 257)):
+            for dtype in (torch.float32, torch.float16, torch.bfloat16):
+                x = torch.rand(1, c, d, device=device, dtype=dtype)
+                for case in build_stability_cases(x, None, x, x[0, 0], compile_functions=False):
+                    with self.subTest(shape=x.shape, dtype=dtype, case=case.name):
+                        torch.testing.assert_close(case.fn(), case.expected, atol=1e-5,
+                                                   rtol=max(1e-5, torch.finfo(dtype).eps))
+
     def test_stability_balances_order_and_pairs_each_round(self):
         from unittest.mock import patch
         from benchmarks.compare_ordering import measure_stability
