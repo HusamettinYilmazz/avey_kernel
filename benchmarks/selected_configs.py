@@ -4,6 +4,8 @@ This uses private PyTorch runtime attributes. Unknown/unresolved selections are
 reported explicitly. External library calls such as cuBLAS are outside its scope.
 """
 from collections.abc import Mapping
+from contextlib import contextmanager
+import math
 from functools import wraps
 from unittest.mock import patch
 
@@ -65,3 +67,37 @@ def capture_selected_configs(fn):
     with patch.object(CachingAutotuner, 'run', observed):
         output = fn()
     return output, list(records.values())
+
+
+@contextmanager
+def capture_autotuning_choices():
+    """Observe original Inductor candidate scores without changing selection.
+
+    Use around initial compilation/validation only, never around measurement.
+    An empty list means no in-process benchmark was observed; it alone does not
+    prove a cache hit. Scores retain their original evaluation order.
+    """
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+    original = CachingAutotuner.benchmark_all_configs
+    events = []
+
+    @wraps(original)
+    def observed(autotuner, *args, **kwargs):
+        timings = original(autotuner, *args, **kwargs)
+        if '_mix_kernel' in getattr(autotuner.fn, '__name__', ''):
+            candidates = []
+            for index, (launcher, milliseconds) in enumerate(timings.items()):
+                config = launcher.config
+                candidates.append(dict(index=index,
+                    parameters={str(k): _json_value(v) for k, v in config.kwargs.items()},
+                    num_warps=config.num_warps, num_stages=config.num_stages,
+                    milliseconds=float(milliseconds) if math.isfinite(milliseconds) else None,
+                    n_regs=getattr(launcher, 'n_regs', None),
+                    n_spills=getattr(launcher, 'n_spills', None),
+                    shared_bytes=getattr(launcher, 'shared', None)))
+            events.append(dict(kernel=autotuner.fn.__name__, candidates=candidates,
+                               mutated_arg_names=list(getattr(autotuner, 'mutated_arg_names', ()))))
+        return timings
+
+    with patch.object(CachingAutotuner, 'benchmark_all_configs', observed):
+        yield events

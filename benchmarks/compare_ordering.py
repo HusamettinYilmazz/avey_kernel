@@ -231,7 +231,7 @@ def build_tuned_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
     return cases
 
 
-def measure_stability(cases, *, warmup, iterations, repeats, baseline='w4_s3'):
+def measure_stability(cases, *, warmup, iterations, repeats, baseline='w4_s3', reference='pytorch'):
     """Six balanced orders, with speedups paired within each round."""
     for round_number, order in enumerate(permutations(cases), start=1):
         rows = []
@@ -245,7 +245,7 @@ def measure_stability(cases, *, warmup, iterations, repeats, baseline='w4_s3'):
             rows.append(result)
         times = {r['case'].split('/')[2]: r['gpu_span_us'] for r in rows}
         for result in rows:
-            result['speedup_vs_pytorch'] = times['pytorch'] / result['gpu_span_us']
+            result[f'speedup_vs_{reference}'] = times[reference] / result['gpu_span_us']
             result[f'speedup_vs_{baseline}'] = times[baseline] / result['gpu_span_us']
             yield result
 

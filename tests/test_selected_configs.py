@@ -71,6 +71,37 @@ class SelectedConfigTests(unittest.TestCase):
         self.assertEqual(records[0]['status'], 'unresolved')
         self.assertNotIn('parameters', records[0])
 
+    def test_records_candidate_scores_without_changing_selection(self):
+        from benchmarks.selected_configs import capture_autotuning_choices
+        class Launcher:
+            def __init__(self, bm):
+                self.config = NS(kwargs={'BM': bm, 'BN': 64, 'BD': 128, 'GROUP_M': 1},
+                                 num_warps=4, num_stages=1)
+                self.n_regs, self.n_spills, self.shared = 222, 0, 16384
+        a, b = Launcher(32), Launcher(16)
+        scores = {a: .1, b: .2}
+        class FakeAutotuner:
+            fn = NS(__name__='_mix_kernel')
+            mutated_arg_names = ['Out']
+            def benchmark_all_configs(self, *args, **kwargs):
+                return scores
+        original = FakeAutotuner.benchmark_all_configs
+        with patch('torch._inductor.runtime.triton_heuristics.CachingAutotuner', FakeAutotuner):
+            with capture_autotuning_choices() as events:
+                returned = FakeAutotuner().benchmark_all_configs()
+        self.assertIs(returned, scores)
+        self.assertIs(FakeAutotuner.benchmark_all_configs, original)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['mutated_arg_names'], ['Out'])
+        self.assertEqual([c['milliseconds'] for c in events[0]['candidates']], [.1, .2])
+        self.assertEqual([c['parameters']['BM'] for c in events[0]['candidates']], [32, 16])
+
+    def test_no_candidate_event_is_reported_when_no_tuning_occurs(self):
+        from benchmarks.selected_configs import capture_autotuning_choices
+        with capture_autotuning_choices() as events:
+            pass
+        self.assertEqual(events, [])
+
     def test_restores_observer_after_failure(self):
         from benchmarks.selected_configs import capture_selected_configs
         class FakeAutotuner:

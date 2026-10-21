@@ -94,6 +94,24 @@ class OrderingComparisonTests(unittest.TestCase):
                 self.assertIsNone(row['num_warps'])
                 self.assertIsNone(row['num_stages'])
 
+    def test_selection_rounds_accept_a_reference_other_than_pytorch(self):
+        from unittest.mock import patch
+        from benchmarks.compare_ordering import measure_stability
+        from benchmarks.profile_contextualizer import ProfileCase
+        cases = [ProfileCase(f'avey_b/mix_only/{label}/compiled', None, None)
+                 for label in ('bm32_g1', 'bm16_g8', 'autotuned')]
+        def timing(case, mode, **kwargs):
+            t = {'bm32_g1': 100., 'bm16_g8': 125., 'autotuned': 125.}[case.name.split('/')[2]]
+            return dict(case=case.name, gpu_span_us=t)
+        with patch('benchmarks.compare_ordering.measure_case', side_effect=timing):
+            rows = list(measure_stability(cases, warmup=1, iterations=1, repeats=1,
+                                          baseline='bm32_g1', reference='bm32_g1'))
+        self.assertEqual(len(rows), 18)
+        for row in rows:
+            expected = 1. if '/bm32_g1/' in row['case'] else .8
+            self.assertEqual(row['speedup_vs_bm32_g1'], expected)
+            self.assertNotIn('speedup_vs_pytorch', row)
+
     def test_stability_balances_order_and_pairs_each_round(self):
         from unittest.mock import patch
         from benchmarks.compare_ordering import measure_stability
