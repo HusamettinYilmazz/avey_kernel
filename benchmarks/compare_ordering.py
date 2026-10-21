@@ -9,6 +9,7 @@ Add --comparison launch to sweep warps=4/8 and stages=1/2/3 at BM32/BD128.
 Add --comparison stability to compare w4_s3, w4_s1, and PyTorch in all six orders.
 Add --comparison tuned to compare autotuned mixing, w4_s1, and PyTorch in all six orders.
 Launch, stability, and tuned comparisons accept --operation avey_b for dynamic Avey-B mixing.
+Add --capture-configs to inspect selected Inductor launchers before timing.
 
 python3 -m benchmarks.compare_ordering --output-dir gpu-profile-ordering-fixed
 """
@@ -275,6 +276,8 @@ def main():
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--iterations', type=int, default=100)
     parser.add_argument('--repeats', type=int, default=5)
+    parser.add_argument('--capture-configs', action='store_true',
+                        help='record executed Inductor Triton configurations outside timing')
     parser.add_argument('--output-dir', type=Path, default=None)
     args = parser.parse_args()
     if args.operation == 'avey_b' and args.comparison not in ('launch', 'stability', 'tuned'):
@@ -316,7 +319,7 @@ def main():
                     group_sizes=[1, 4, 8] if args.comparison in ('ordering', 'tuned') else [1],
                     skip_causal_options=[False, True] if args.comparison == 'causal' else [True],
                     autotune=args.comparison == 'tuned', pytorch_max_autotune=args.comparison != 'ordering',
-                    normalization_timed=False, mode='cuda_graph',
+                    normalization_timed=False, mode='cuda_graph', capture_configs=args.capture_configs,
                     warmup=args.warmup, iterations=args.iterations, repeats=args.repeats,
                     matmul_precision='highest')
     results = []
@@ -334,6 +337,24 @@ def main():
         cases = builder(x, v if args.operation == 'avey' else None, gate, bias)
         for case in cases:
             _check(case.fn(), case.expected)  # Compilation and validation outside timing.
+        if args.capture_configs:
+            from benchmarks.selected_configs import capture_selected_configs
+            selections = dict(scope='Executed Inductor Triton kernels; excludes external library calls',
+                              cases={})
+            report['selected_configs'] = selections
+            for case in cases:
+                output, records = capture_selected_configs(case.fn)
+                _check(output, case.expected)
+                selections['cases'][case.name] = records
+                (args.output_dir / 'selected-configs.json').write_text(
+                    json.dumps(selections, indent=2) + '\n')
+                report_path.write_text(json.dumps(report, indent=2) + '\n')
+                print(f'Selected configurations: {case.name}: {json.dumps(records)}', flush=True)
+                if '/mix_only/' in case.name and '/pytorch/' not in case.name:
+                    if not any(r['status'] == 'selected' and '_mix_kernel' in r['kernel']
+                               for r in records):
+                        raise RuntimeError('No selected mixing launcher captured; see selected-configs.json. '
+                                           'The installed Inductor runtime may require a different observer.')
         if args.comparison in ('stability', 'tuned'):
             for result in measure_stability(cases, warmup=args.warmup,
                                             iterations=args.iterations, repeats=args.repeats,
