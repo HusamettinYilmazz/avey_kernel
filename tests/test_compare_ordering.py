@@ -17,6 +17,51 @@ class OrderingComparisonTests(unittest.TestCase):
         torch.testing.assert_close(result, torch.tensor([[[5., 2.], [57., 2.]]]))
 
     @unittest.skipIf(os.environ.get('TRITON_INTERPRET') == '1', 'requires JIT wrapping')
+    def test_launch_sweep_keeps_math_and_grid_fixed(self):
+        from benchmarks.compare_ordering import mix_fixed_order, LAUNCH_CONFIGS
+        from avey_kernels._triton import _mix_kernel
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+        implementation = inspect.getclosurevars(mix_fixed_order._init_fn).nonlocals['fn']
+        self.assertEqual(set(LAUNCH_CONFIGS), {(w, s) for w in (4, 8) for s in (1, 2, 3)})
+        for warps, stages in LAUNCH_CONFIGS:
+            def fn(x):
+                return implementation(x, x, x[0, :, :67].contiguous(), x,
+                                      x[0, 0], 1, True, 32, 128, warps, stages)
+            graph = make_fx(fn, tracing_mode='fake')(torch.empty(2, 67, 257))
+            launches = [n for n in graph.graph.nodes
+                        if 'triton_kernel_wrapper_mutation' in str(n.target)]
+            self.assertEqual(len(launches), 1)
+            args = launches[0].kwargs['kwargs']
+            self.assertEqual(set(args), set(_mix_kernel.arg_names))
+            self.assertEqual({k: args[k] for k in
+                              ('BM', 'BN', 'BK', 'BD', 'GROUP_M', 'SKIP_CAUSAL')},
+                             dict(BM=32, BN=64, BK=32, BD=128, GROUP_M=1, SKIP_CAUSAL=True))
+            kernel = kernel_side_table.get_kernel(launches[0].kwargs['kernel_idx'])
+            self.assertEqual(len(kernel.configs), 1)
+            self.assertEqual(kernel.configs[0].num_warps, warps)
+            self.assertEqual(kernel.configs[0].num_stages, stages)
+
+    @unittest.skipUnless(os.environ.get('TRITON_INTERPRET') == '1'
+                         or (torch.cuda.is_available() and torch.version.hip is None
+                             and torch.cuda.get_device_capability()[0] >= 8),
+                         'requires interpreter or NVIDIA SM80+')
+    def test_launch_sweep_matches_reference(self):
+        from benchmarks.compare_ordering import build_launch_cases
+        device = 'cpu' if os.environ.get('TRITON_INTERPRET') == '1' else 'cuda'
+        torch.manual_seed(45)
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            x = torch.rand(1, 35, 133, device=device, dtype=dtype)
+            v = torch.randn(35, 35, device=device, dtype=dtype)
+            cases = build_launch_cases(x, v, x, x[0, 0], compile_functions=False)
+            self.assertEqual(len(cases), 7)
+            self.assertEqual(len({case.name for case in cases}), 7)
+            for case in cases:
+                with self.subTest(dtype=dtype, case=case.name):
+                    torch.testing.assert_close(case.fn(), case.expected, atol=1e-5,
+                                               rtol=max(1e-5, torch.finfo(dtype).eps))
+
+    @unittest.skipIf(os.environ.get('TRITON_INTERPRET') == '1', 'requires JIT wrapping')
     def test_tile_sweep_keeps_other_launch_settings_fixed(self):
         from benchmarks.compare_ordering import mix_fixed_order
         from avey_kernels._triton import _mix_kernel
