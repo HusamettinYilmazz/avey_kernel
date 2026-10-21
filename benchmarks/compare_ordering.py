@@ -1,4 +1,7 @@
-"""Controlled ordering or causal-skip comparison; no autotuning/timed normalization.
+"""Controlled ordering or causal-skip comparison; no timed normalization.
+
+Our Triton launch configurations are fixed. The causal comparison also includes
+an optimized PyTorch mixing baseline, with GEMM tuning completed before timing.
 
 Add --comparison causal to compare full key traversal against skipping future tiles.
 
@@ -66,8 +69,18 @@ def build_ordering_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
     return cases
 
 
+def torch_causal_mix(z_tr, z_tr_norm, v, z_tl, bias):
+    """Same Avey mixing math and FP32 accumulation, consuming precomputed Q."""
+    scores = (z_tr_norm @ z_tr_norm.transpose(-1, -2)) * v.float()
+    c = z_tr.shape[1]
+    allowed = torch.ones(c, c, device=z_tr.device, dtype=torch.bool).tril()
+    scores = scores.masked_fill(~allowed, 0.)
+    output = ((scores @ z_tr.float()) + bias.float()) * z_tl.float()
+    return output.to(z_tr.dtype)
+
+
 def build_causal_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
-    """Only the key-loop bound differs; GROUP_M=1 and all launch settings fixed."""
+    """Compare fixed full/shortened key loops and an optimized PyTorch mixing baseline."""
     z_tr_norm = F.normalize(z_tr.float(), dim=-1, eps=1e-12).contiguous()
     expected = avey(z_tr, v, z_tl=z_tl, bias=bias, backend='torch')
     cases = []
@@ -81,6 +94,15 @@ def build_causal_cases(z_tr, v, z_tl, bias, *, compile_functions=True):
                 'triton.cudagraphs': False,
             })
         cases.append(ProfileCase(f'avey/mix_only/{label}/{suffix}', fn, expected, 128))
+    def reference():
+        return torch_causal_mix(z_tr, z_tr_norm, v, z_tl, bias)
+
+    if compile_functions:
+        reference = torch.compile(reference, fullgraph=True, options={
+            'max_autotune': True, 'coordinate_descent_tuning': True,
+            'triton.cudagraphs': False,
+        })
+    cases.append(ProfileCase(f'avey/mix_only/pytorch/{suffix}', reference, expected))
     return cases
 
 
@@ -114,7 +136,8 @@ def main():
                     seed=42, fixed_config=FIXED_CONFIG, comparison=args.comparison,
                     group_sizes=[1, 4, 8] if args.comparison == 'ordering' else [1],
                     skip_causal_options=[True] if args.comparison == 'ordering' else [False, True],
-                    autotune=False, normalization_timed=False, mode='cuda_graph',
+                    autotune=False, pytorch_max_autotune=args.comparison == 'causal',
+                    normalization_timed=False, mode='cuda_graph',
                     warmup=args.warmup, iterations=args.iterations, repeats=args.repeats,
                     matmul_precision='highest')
     results = []
@@ -141,8 +164,8 @@ def main():
                 result['group_m'] = int(group.removeprefix('group'))
                 speedup_key = 'speedup_vs_group1'
             else:
-                result['group_m'] = 1
-                result['skip_causal'] = group == 'skip_future'
+                result['group_m'] = None if group == 'pytorch' else 1
+                result['skip_causal'] = None if group == 'pytorch' else group == 'skip_future'
                 speedup_key = 'speedup_vs_full_keys'
             result[speedup_key] = baselines[architecture] / result['gpu_span_us']
             results.append(result)
@@ -150,6 +173,12 @@ def main():
             print(f'{case.name:40s} {result["gpu_span_us"]:9.3f} us '
                   f'range=[{result["gpu_span_min_us"]:.3f}, {result["gpu_span_max_us"]:.3f}] '
                   f'speedup={result[speedup_key]:.3f}x', flush=True)
+    if args.comparison == 'causal':
+        pytorch_us = next(r['gpu_span_us'] for r in results if '/pytorch/' in r['case'])
+        print('Speedup relative to compiled PyTorch mixing:', flush=True)
+        for result in results:
+            result['speedup_vs_pytorch'] = pytorch_us / result['gpu_span_us']
+            print(f'{result["case"]:40s} {result["speedup_vs_pytorch"]:.3f}x', flush=True)
     report['complete'] = True
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     with (args.output_dir / 'timings.csv').open('w', newline='') as file:

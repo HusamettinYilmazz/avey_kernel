@@ -66,7 +66,8 @@ class CausalSkippingTests(unittest.TestCase):
             x = torch.rand(1, 67, 133, device=device, dtype=dtype)
             v = torch.randn(67, 67, device=device, dtype=dtype)
             cases = build_causal_cases(x, v, x, x[0, 0], compile_functions=False)
-            self.assertEqual(len(cases), 2)
+            self.assertEqual(len(cases), 3)
+            self.assertTrue(any('/pytorch/' in case.name for case in cases))
             for case in cases:
                 torch.testing.assert_close(case.fn(), case.expected, atol=1e-5,
                                            rtol=max(1e-5, torch.finfo(dtype).eps))

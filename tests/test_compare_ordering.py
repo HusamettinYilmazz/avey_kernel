@@ -6,6 +6,16 @@ import torch
 
 
 class OrderingComparisonTests(unittest.TestCase):
+    def test_pytorch_baseline_consumes_supplied_normalized_input(self):
+        from benchmarks.compare_ordering import torch_causal_mix
+        # Deliberately use Q != N(x): recomputing normalization would give a
+        # different answer and invalidate the isolated mixing comparison.
+        x = torch.tensor([[[1., 0.], [3., 0.]]])
+        q = torch.tensor([[[2., 0.], [4., 0.]]])
+        v = torch.ones(2, 2)
+        result = torch_causal_mix(x, q, v, torch.ones_like(x), torch.tensor([1., 2.]))
+        torch.testing.assert_close(result, torch.tensor([[[5., 2.], [57., 2.]]]))
+
     @unittest.skipIf(os.environ.get('TRITON_INTERPRET') == '1', 'requires JIT wrapping')
     def test_lowered_cases_change_only_group_size(self):
         from benchmarks.compare_ordering import mix_fixed_order
